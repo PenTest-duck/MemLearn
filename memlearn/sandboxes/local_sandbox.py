@@ -210,3 +210,76 @@ class LocalSandbox(BaseSandbox):
                 total_size += os.path.getsize(filepath)
         
         return total_size
+
+    # =========================================================================
+    # Sync operations for persistence
+    # =========================================================================
+
+    def sync_from_persistent(
+        self, persistent_path: str, folders: list[str]
+    ) -> None:
+        """
+        Copy folders from persistent storage into ephemeral sandbox.
+
+        Args:
+            persistent_path: Path to persistent agent storage
+                (e.g., ~/.memlearn/persistent/agents/{id}/)
+            folders: Folders to sync (e.g., ["memory", "raw", "mnt"])
+        """
+        for folder in folders:
+            src = os.path.join(persistent_path, folder)
+            dst = self._full_path(folder)
+
+            if os.path.exists(src) and os.path.isdir(src):
+                # Remove existing folder in sandbox if it exists
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                # Copy from persistent to sandbox
+                shutil.copytree(src, dst)
+
+    def sync_to_persistent(
+        self, persistent_path: str, folders: list[str]
+    ) -> None:
+        """
+        Copy folders from ephemeral sandbox to persistent storage.
+
+        Args:
+            persistent_path: Path to persistent agent storage
+            folders: Folders to sync (e.g., ["memory", "raw", "mnt"])
+        """
+        # Ensure persistent path exists
+        os.makedirs(persistent_path, exist_ok=True)
+
+        for folder in folders:
+            src = self._full_path(folder)
+            dst = os.path.join(persistent_path, folder)
+
+            if os.path.exists(src) and os.path.isdir(src):
+                # Remove existing folder in persistent storage if it exists
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                # Copy from sandbox to persistent
+                shutil.copytree(src, dst)
+
+    def clear_directory_contents(self, path: str) -> None:
+        """
+        Clear all contents of a directory without deleting the directory itself.
+
+        Args:
+            path: Relative path within the sandbox.
+        """
+        full_path = self._full_path(path)
+
+        if not os.path.exists(full_path):
+            return  # Nothing to clear
+
+        if not os.path.isdir(full_path):
+            raise NotADirectoryError(f"Path is not a directory: {path}")
+
+        # Remove all contents
+        for item in os.listdir(full_path):
+            item_path = os.path.join(full_path, item)
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)

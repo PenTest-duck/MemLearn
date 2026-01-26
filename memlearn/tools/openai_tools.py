@@ -266,6 +266,28 @@ class OpenAIToolProvider(BaseToolProvider):
                     },
                 },
             },
+            # Compact conversation
+            {
+                "type": "function",
+                "function": {
+                    "name": self._tool_name("compact"),
+                    "description": "Compact the conversation history by summarizing older messages. Use when the context window is getting full. The full history is preserved in MemFS for observability. Returns compacted messages to use for the next LLM call.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "summary": {
+                                "type": "string",
+                                "description": "A comprehensive summary of the conversation and progress so far. Include key decisions, important context, and current state.",
+                            },
+                            "preserve_last_n": {
+                                "type": "integer",
+                                "description": "Number of recent messages to keep uncompacted. Default is 10.",
+                            },
+                        },
+                        "required": ["summary"],
+                    },
+                },
+            },
         ]
 
     def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
@@ -281,7 +303,7 @@ class OpenAIToolProvider(BaseToolProvider):
         """
         # Strip prefix if present
         if tool_name.startswith(f"{self.tool_prefix}_"):
-            tool_name = tool_name[len(self.tool_prefix) + 1:]
+            tool_name = tool_name[len(self.tool_prefix) + 1 :]
 
         # Map tool names to MemFS methods
         tool_map = {
@@ -294,22 +316,27 @@ class OpenAIToolProvider(BaseToolProvider):
             "move": self._execute_move,
             "search": self._execute_search,
             "peek": self._execute_peek,
+            "compact": self._execute_compact,
         }
 
         if tool_name not in tool_map:
-            return json.dumps({
-                "status": "error",
-                "message": f"Unknown tool: {tool_name}",
-            })
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": f"Unknown tool: {tool_name}",
+                }
+            )
 
         try:
             result = tool_map[tool_name](arguments)
             return json.dumps(result.to_dict())
         except Exception as e:
-            return json.dumps({
-                "status": "error",
-                "message": f"Tool execution failed: {str(e)}",
-            })
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": f"Tool execution failed: {str(e)}",
+                }
+            )
 
     def _execute_read(self, args: dict[str, Any]):
         return self.memfs.read_file(
@@ -370,6 +397,12 @@ class OpenAIToolProvider(BaseToolProvider):
 
     def _execute_peek(self, args: dict[str, Any]):
         return self.memfs.peek(path=args["path"])
+
+    def _execute_compact(self, args: dict[str, Any]):
+        return self.memfs.compact_conversation(
+            summary=args["summary"],
+            preserve_last_n=args.get("preserve_last_n", 10),
+        )
 
 
 def get_openai_tools(memfs: MemFS, tool_prefix: str = "memfs") -> list[dict[str, Any]]:

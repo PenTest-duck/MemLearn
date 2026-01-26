@@ -6,7 +6,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from memlearn.types import MemFSLog, NodeMetadata, VersionSnapshot
+from memlearn.types import (
+    Agent,
+    MemFSLog,
+    MountInfo,
+    NodeMetadata,
+    Session,
+    SessionStatus,
+    VersionSnapshot,
+)
 
 
 class BaseDatabase(ABC):
@@ -22,7 +30,101 @@ class BaseDatabase(ABC):
         """Close the database connection."""
         pass
 
+    # =========================================================================
+    # Agent operations
+    # =========================================================================
+
+    @abstractmethod
+    def create_agent(self, agent: Agent) -> None:
+        """Create a new agent."""
+        pass
+
+    @abstractmethod
+    def get_agent_by_id(self, agent_id: str) -> Agent | None:
+        """Get an agent by ID."""
+        pass
+
+    @abstractmethod
+    def get_agent_by_name(self, name: str) -> Agent | None:
+        """Get an agent by name."""
+        pass
+
+    @abstractmethod
+    def list_agents(self) -> list[Agent]:
+        """List all agents."""
+        pass
+
+    @abstractmethod
+    def delete_agent(self, agent_id: str) -> bool:
+        """Delete an agent. Returns True if deleted."""
+        pass
+
+    # =========================================================================
+    # Session operations
+    # =========================================================================
+
+    @abstractmethod
+    def create_session(self, session: Session) -> None:
+        """Create a new session."""
+        pass
+
+    @abstractmethod
+    def get_session(self, session_id: str) -> Session | None:
+        """Get a session by ID."""
+        pass
+
+    @abstractmethod
+    def update_session(self, session: Session) -> None:
+        """Update an existing session."""
+        pass
+
+    @abstractmethod
+    def end_session(
+        self, session_id: str, status: SessionStatus = SessionStatus.COMPLETED
+    ) -> None:
+        """End a session with the given status."""
+        pass
+
+    @abstractmethod
+    def get_sessions_for_agent(
+        self, agent_id: str, limit: int = 50
+    ) -> list[Session]:
+        """Get sessions for an agent, most recent first."""
+        pass
+
+    @abstractmethod
+    def get_active_session_for_agent(self, agent_id: str) -> Session | None:
+        """Get the currently active session for an agent, if any."""
+        pass
+
+    # =========================================================================
+    # Mount operations
+    # =========================================================================
+
+    @abstractmethod
+    def create_mount(self, mount: MountInfo) -> None:
+        """Create a new mount record."""
+        pass
+
+    @abstractmethod
+    def get_mounts_for_agent(self, agent_id: str) -> list[MountInfo]:
+        """Get all mounts for an agent."""
+        pass
+
+    @abstractmethod
+    def delete_mount(self, mount_id: str) -> bool:
+        """Delete a mount record. Returns True if deleted."""
+        pass
+
+    @abstractmethod
+    def delete_mounts_for_agent(self, agent_id: str) -> int:
+        """Delete all mounts for an agent. Returns count deleted."""
+        pass
+
+    # =========================================================================
     # Node metadata operations
+    # =========================================================================
+
     @abstractmethod
     def save_metadata(self, metadata: NodeMetadata) -> None:
         """Save or update node metadata."""
@@ -53,7 +155,10 @@ class BaseDatabase(ABC):
         """Search metadata by tags."""
         pass
 
+    # =========================================================================
     # Log operations
+    # =========================================================================
+
     @abstractmethod
     def save_log(self, log: MemFSLog) -> None:
         """Save a log entry."""
@@ -66,7 +171,10 @@ class BaseDatabase(ABC):
         """Get log entries with optional path filter."""
         pass
 
+    # =========================================================================
     # Version control operations
+    # =========================================================================
+
     @abstractmethod
     def save_snapshot(self, snapshot: VersionSnapshot) -> None:
         """Save a version snapshot."""

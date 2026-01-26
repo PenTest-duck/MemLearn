@@ -209,3 +209,44 @@ class BaseSandbox(ABC):
         if path.startswith("/"):
             path = path[1:]
         return f"{self.root_path}/{path}" if path else self.root_path
+
+    # =========================================================================
+    # Sync operations for persistence
+    # =========================================================================
+
+    @abstractmethod
+    def sync_from_persistent(
+        self, persistent_path: str, folders: list[str]
+    ) -> None:
+        """
+        Copy folders from persistent storage into ephemeral sandbox.
+
+        Args:
+            persistent_path: Path to persistent agent storage
+                (e.g., ~/.memlearn/persistent/agents/{id}/)
+            folders: Folders to sync (e.g., ["memory", "raw", "mnt"])
+        """
+        pass
+
+    @abstractmethod
+    def sync_to_persistent(
+        self, persistent_path: str, folders: list[str]
+    ) -> None:
+        """
+        Copy folders from ephemeral sandbox to persistent storage.
+
+        Args:
+            persistent_path: Path to persistent agent storage
+            folders: Folders to sync (e.g., ["memory", "raw", "mnt"])
+        """
+        pass
+
+    @abstractmethod
+    def clear_directory_contents(self, path: str) -> None:
+        """
+        Clear all contents of a directory without deleting the directory itself.
+
+        Args:
+            path: Relative path within the sandbox.
+        """
+        pass

@@ -7,10 +7,13 @@ and retrieve memory with semantic search capabilities.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
+import json
 import re
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from memlearn.config import MemLearnConfig
@@ -23,19 +26,31 @@ from memlearn.rerankers.cohere_reranker import CohereReranker
 from memlearn.sandboxes.base import BaseSandbox
 from memlearn.sandboxes.local_sandbox import LocalSandbox
 from memlearn.types import (
+    Agent,
     Chunk,
+    ConversationHistory,
     FileType,
     MemFSLog,
+    MountInfo,
+    MountSourceType,
     NodeMetadata,
     NodeType,
     Permissions,
     SearchResult,
+    Session,
+    SessionStatus,
     Timestamps,
     ToolResult,
     VersionSnapshot,
 )
 from memlearn.vector_stores.base import BaseVectorStore
 from memlearn.vector_stores.chroma_vdb import ChromaVectorStore
+
+# Folders to sync between persistent and ephemeral storage
+PERSISTENT_FOLDERS = ["memory", "raw", "mnt"]
+
+# Conversation history file path
+CONVERSATION_HISTORY_PATH = "/raw/conversation-history/CURRENT.json"
 
 # Default AGENTS.md content that explains how to use MemFS
 AGENTS_MD_CONTENT = """# MemFS Agent Guide
@@ -219,7 +234,10 @@ class MemFS:
         return descriptions.get(path, "")
 
     def close(self) -> None:
-        """Close MemFS and clean up resources."""
+        """Close MemFS and clean up resources without persisting state.
+
+        Use spindown() instead if you want to persist state before closing.
+        """
         if not self._initialized:
             return
 
@@ -230,12 +248,580 @@ class MemFS:
 
     def __enter__(self) -> "MemFS":
         """Context manager entry."""
-        self.initialize()
+        # If already initialized via for_agent(), just return self
+        if not self._initialized:
+            self.initialize()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         """Context manager exit."""
-        self.close()
+        # If we have an active session, spin down properly
+        if self.config.session_id:
+            status = SessionStatus.ABORTED if exc_type else SessionStatus.COMPLETED
+            self.spindown(status=status)
+        else:
+            self.close()
+
+    # =========================================================================
+    # Session Lifecycle Methods
+    # =========================================================================
+
+    def spinup(self, agent_name: str, session_id: str | None = None) -> None:
+        """
+        Initialize MemFS for an agent session.
+
+        This is the main entry point for starting a persistent agent session.
+        It will:
+        1. Load or create the agent entity in the database
+        2. Create a new session record
+        3. Initialize ephemeral sandbox
+        4. Sync persistent storage into the sandbox
+        5. Initialize conversation history
+
+        Args:
+            agent_name: Unique name for the agent (e.g., "code-editor")
+            session_id: Optional custom session ID. Generated if not provided.
+        """
+        if self._initialized:
+            raise RuntimeError("MemFS is already initialized. Call spindown() first.")
+
+        # Initialize database first (needed for agent operations)
+        self.database.initialize()
+
+        # Load or create agent
+        agent = self.database.get_agent_by_name(agent_name)
+        if agent is None:
+            agent = Agent.create(name=agent_name)
+            self.database.create_agent(agent)
+
+        # Check for any orphaned active sessions and end them
+        active_session = self.database.get_active_session_for_agent(agent.agent_id)
+        if active_session:
+            self.database.end_session(
+                active_session.session_id, SessionStatus.ABORTED
+            )
+
+        # Create new session
+        session = Session.create(agent_id=agent.agent_id)
+        if session_id:
+            session.session_id = session_id
+        self.database.create_session(session)
+
+        # Update config with agent and session info
+        self.config.agent_id = agent.agent_id
+        self.config.session_id = session.session_id
+        self.config.agent_name = agent.name
+
+        # Initialize sandbox
+        self.sandbox.initialize()
+        self.vector_store.initialize()
+
+        # Create default folder structure in sandbox
+        self._create_default_structure()
+
+        # Sync from persistent storage to sandbox
+        persistent_path = self.config.sandbox.get_agent_persistent_path(agent.agent_id)
+        if persistent_path.exists():
+            self.sandbox.sync_from_persistent(str(persistent_path), PERSISTENT_FOLDERS)
+            # Clear /tmp after sync (it should always start empty)
+            self.sandbox.clear_directory_contents("tmp")
+
+        # Remount any previously mounted folders
+        self._remount_saved_mounts()
+
+        # Initialize conversation history for this session
+        self._init_conversation_history()
+
+        self._initialized = True
+
+    def spindown(self, status: SessionStatus = SessionStatus.COMPLETED) -> None:
+        """
+        End session and persist state.
+
+        This will:
+        1. Archive conversation history (rename CURRENT to timestamp)
+        2. Sync sandbox to persistent storage
+        3. Update session record
+        4. Clean up ephemeral sandbox
+
+        Args:
+            status: Final session status (completed or aborted)
+        """
+        if not self._initialized:
+            return
+
+        # Archive conversation history
+        self._archive_conversation_history()
+
+        # Sync to persistent storage (excluding /tmp)
+        if self.config.agent_id:
+            persistent_path = self.config.sandbox.get_agent_persistent_path(
+                self.config.agent_id
+            )
+            self.sandbox.sync_to_persistent(str(persistent_path), PERSISTENT_FOLDERS)
+
+        # End session in database
+        if self.config.session_id:
+            self.database.end_session(self.config.session_id, status)
+
+        # Clean up
+        self.vector_store.close()
+        self.database.close()
+        self.sandbox.cleanup()
+
+        # Reset state
+        self.config.agent_id = None
+        self.config.session_id = None
+        self.config.agent_name = None
+        self._initialized = False
+
+    @classmethod
+    def for_agent(
+        cls,
+        agent_name: str,
+        config: MemLearnConfig | None = None,
+    ) -> "MemFS":
+        """
+        Create a MemFS instance for an agent and start a new session.
+
+        This is the primary entry point for developers. It creates the agent
+        if it doesn't exist, then starts a new session with persistence.
+
+        Args:
+            agent_name: Unique name for the agent (e.g., "code-editor")
+            config: Optional configuration. Uses default_persistent() if not provided.
+
+        Returns:
+            Initialized MemFS instance ready for use.
+
+        Example:
+            ```python
+            # Context manager (recommended)
+            with MemFS.for_agent("code-editor") as memfs:
+                tools = OpenAIToolProvider(memfs)
+                # ... run agent session ...
+            # Automatically persists and cleans up
+
+            # Manual lifecycle
+            memfs = MemFS.for_agent("code-editor")
+            try:
+                # ... run agent session ...
+            finally:
+                memfs.spindown()
+            ```
+        """
+        # Use persistent config by default
+        if config is None:
+            config = MemLearnConfig.default_persistent()
+
+        memfs = cls(config=config)
+        memfs.spinup(agent_name)
+        return memfs
+
+    # =========================================================================
+    # Conversation History Methods
+    # =========================================================================
+
+    def _init_conversation_history(self) -> None:
+        """Create CURRENT.json with session metadata. Called during spinup."""
+        if not self.config.session_id or not self.config.agent_id:
+            return
+
+        history = ConversationHistory.create(
+            session_id=self.config.session_id,
+            agent_id=self.config.agent_id,
+            agent_name=self.config.agent_name or "unknown",
+        )
+
+        # Write to file (bypass permissions since this is system operation)
+        content = json.dumps(history.to_dict(), indent=2)
+        self.sandbox.write_file("raw/conversation-history/CURRENT.json", content)
+
+        # Create metadata for the file
+        metadata = NodeMetadata(
+            path=CONVERSATION_HISTORY_PATH,
+            node_type=NodeType.FILE,
+            permissions=Permissions(readable=True, writable=False, executable=False),
+            owner="system",
+            file_type=FileType.JSON,
+            description=f"Conversation history for session {self.config.session_id}",
+            size_bytes=len(content.encode()),
+            line_count=content.count("\n") + 1,
+            extra={"session_id": self.config.session_id},
+        )
+        self.database.save_metadata(metadata)
+
+    def _archive_conversation_history(self) -> None:
+        """Rename CURRENT.json to timestamp format. Called during spindown."""
+        current_path = "raw/conversation-history/CURRENT.json"
+
+        if not self.sandbox.exists(current_path):
+            return
+
+        # Read the history to get the start time
+        try:
+            content = self.sandbox.read_file(current_path)
+            history_data = json.loads(content)
+            started_at = history_data.get("started_at", time.time())
+
+            # Create timestamp filename (ISO format with safe characters)
+            dt = datetime.datetime.fromtimestamp(started_at)
+            timestamp_str = dt.strftime("%Y-%m-%dT%H-%M-%S")
+            archive_filename = f"{timestamp_str}.json"
+            archive_path = f"raw/conversation-history/{archive_filename}"
+
+            # Rename the file
+            self.sandbox.move(current_path, archive_path)
+
+            # Update metadata
+            old_metadata = self.database.get_metadata(CONVERSATION_HISTORY_PATH)
+            if old_metadata:
+                self.database.delete_metadata(CONVERSATION_HISTORY_PATH)
+                old_metadata.path = f"/raw/conversation-history/{archive_filename}"
+                old_metadata.description = (
+                    f"Archived conversation history from {timestamp_str}"
+                )
+                self.database.save_metadata(old_metadata)
+
+        except Exception:
+            # If anything fails, just leave the file as is
+            pass
+
+    def append_conversation_message(self, message: dict[str, Any]) -> None:
+        """
+        Append a message to the current session's conversation history.
+
+        Call this after each LLM interaction to keep the history updated.
+
+        Args:
+            message: A message dict with role and content
+                (e.g., {"role": "user", "content": "..."})
+        """
+        current_path = "raw/conversation-history/CURRENT.json"
+
+        if not self.sandbox.exists(current_path):
+            return
+
+        try:
+            content = self.sandbox.read_file(current_path)
+            history = ConversationHistory.from_dict(json.loads(content))
+            history.append_message(message)
+
+            new_content = json.dumps(history.to_dict(), indent=2)
+            self.sandbox.write_file(current_path, new_content)
+
+            # Update metadata size
+            metadata = self.database.get_metadata(CONVERSATION_HISTORY_PATH)
+            if metadata:
+                metadata.size_bytes = len(new_content.encode())
+                metadata.line_count = new_content.count("\n") + 1
+                metadata.timestamps.touch_modify()
+                self.database.save_metadata(metadata)
+
+        except Exception:
+            pass
+
+    def get_conversation_history(self) -> list[dict[str, Any]]:
+        """
+        Read current session's full conversation history.
+
+        Returns:
+            List of message dicts from the conversation.
+        """
+        current_path = "raw/conversation-history/CURRENT.json"
+
+        if not self.sandbox.exists(current_path):
+            return []
+
+        try:
+            content = self.sandbox.read_file(current_path)
+            history = ConversationHistory.from_dict(json.loads(content))
+            return history.messages
+        except Exception:
+            return []
+
+    def compact_conversation(
+        self, summary: str, preserve_last_n: int = 10
+    ) -> ToolResult:
+        """
+        Compact conversation history while preserving full history in file.
+
+        This adds a compaction marker to the history file and returns
+        compacted messages for use in the context window.
+
+        Args:
+            summary: A comprehensive summary of the conversation so far
+            preserve_last_n: Number of recent messages to keep uncompacted
+
+        Returns:
+            ToolResult with compacted messages for the context window
+        """
+        current_path = "raw/conversation-history/CURRENT.json"
+
+        if not self.sandbox.exists(current_path):
+            return ToolResult(
+                status="error",
+                message="No active conversation history found.",
+            )
+
+        try:
+            content = self.sandbox.read_file(current_path)
+            history = ConversationHistory.from_dict(json.loads(content))
+
+            if len(history.messages) <= preserve_last_n:
+                return ToolResult(
+                    status="success",
+                    message="Conversation too short to compact.",
+                    data={"messages": history.messages, "compacted": False},
+                )
+
+            # Add compaction marker
+            history.add_compaction_marker(summary)
+
+            # Save updated history with marker
+            new_content = json.dumps(history.to_dict(), indent=2)
+            self.sandbox.write_file(current_path, new_content)
+
+            # Build compacted messages for return
+            # Start with a system message containing the summary
+            compacted_messages = [
+                {
+                    "role": "system",
+                    "content": f"[Previous conversation summary]\n{summary}\n[End of summary - recent messages follow]",
+                }
+            ]
+
+            # Add the preserved recent messages
+            recent_messages = history.messages[-preserve_last_n:]
+            compacted_messages.extend(recent_messages)
+
+            return ToolResult(
+                status="success",
+                message=f"Compacted conversation. Preserved {len(recent_messages)} recent messages.",
+                data={
+                    "messages": compacted_messages,
+                    "compacted": True,
+                    "original_count": len(history.messages),
+                    "preserved_count": len(recent_messages),
+                },
+            )
+
+        except Exception as e:
+            return ToolResult(
+                status="error",
+                message=f"Failed to compact conversation: {str(e)}",
+            )
+
+    # =========================================================================
+    # Mount Operations
+    # =========================================================================
+
+    def mount_agent_memory(
+        self, source_agent_name: str, mount_name: str | None = None
+    ) -> ToolResult:
+        """
+        Mount another agent's memory folder for read access.
+
+        Args:
+            source_agent_name: Name of the agent whose memory to mount
+            mount_name: Optional name for the mount point (defaults to agent name)
+
+        Returns:
+            ToolResult indicating success or failure
+        """
+        if not self.config.agent_id:
+            return ToolResult(
+                status="error",
+                message="No active session. Use spinup() first.",
+            )
+
+        # Find the source agent
+        source_agent = self.database.get_agent_by_name(source_agent_name)
+        if source_agent is None:
+            return ToolResult(
+                status="error",
+                message=f"Agent not found: {source_agent_name}",
+            )
+
+        if source_agent.agent_id == self.config.agent_id:
+            return ToolResult(
+                status="error",
+                message="Cannot mount your own memory. Use /memory directly.",
+            )
+
+        # Determine mount path
+        mount_name = mount_name or source_agent_name
+        mount_path = f"/mnt/agents/{mount_name}"
+
+        # Check if already mounted
+        existing_mounts = self.database.get_mounts_for_agent(self.config.agent_id)
+        for mount in existing_mounts:
+            if mount.mount_path == mount_path:
+                return ToolResult(
+                    status="error",
+                    message=f"Mount point already in use: {mount_path}",
+                )
+
+        # Get the source agent's persistent path
+        source_persistent_path = self.config.sandbox.get_agent_persistent_path(
+            source_agent.agent_id
+        )
+        source_memory_path = source_persistent_path / "memory"
+
+        if not source_memory_path.exists():
+            return ToolResult(
+                status="error",
+                message=f"Source agent has no persistent memory: {source_agent_name}",
+            )
+
+        # Create the mount point in sandbox
+        sandbox_mount_path = f"mnt/agents/{mount_name}"
+        self.sandbox.create_directory(sandbox_mount_path)
+
+        # Copy the source memory into the mount point
+        import shutil
+        dest_path = Path(self.sandbox.root_path) / sandbox_mount_path
+        if dest_path.exists():
+            shutil.rmtree(dest_path)
+        shutil.copytree(source_memory_path, dest_path)
+
+        # Create mount record in database
+        mount = MountInfo.create(
+            agent_id=self.config.agent_id,
+            mount_path=mount_path,
+            source_type=MountSourceType.AGENT,
+            source_ref=source_agent.agent_id,
+        )
+        self.database.create_mount(mount)
+
+        # Create metadata for mount point
+        metadata = NodeMetadata(
+            path=mount_path,
+            node_type=NodeType.FOLDER,
+            permissions=Permissions(readable=True, writable=True, executable=False),
+            owner="system",
+            description=f"Mounted memory from agent: {source_agent_name}",
+        )
+        self.database.save_metadata(metadata)
+
+        return ToolResult(
+            status="success",
+            message=f"Mounted {source_agent_name}'s memory at {mount_path}",
+            data={"mount_path": mount_path, "source_agent": source_agent_name},
+        )
+
+    def unmount(self, mount_path: str) -> ToolResult:
+        """
+        Unmount a previously mounted folder.
+
+        Args:
+            mount_path: Path of the mount point (e.g., /mnt/agents/other-agent)
+
+        Returns:
+            ToolResult indicating success or failure
+        """
+        mount_path = self._normalize_path(mount_path)
+
+        if not self.config.agent_id:
+            return ToolResult(
+                status="error",
+                message="No active session.",
+            )
+
+        # Find the mount
+        mounts = self.database.get_mounts_for_agent(self.config.agent_id)
+        mount_to_remove = None
+        for mount in mounts:
+            if mount.mount_path == mount_path:
+                mount_to_remove = mount
+                break
+
+        if mount_to_remove is None:
+            return ToolResult(
+                status="error",
+                message=f"Mount not found: {mount_path}",
+            )
+
+        # Remove from sandbox
+        sandbox_path = mount_path.lstrip("/")
+        if self.sandbox.exists(sandbox_path):
+            self.sandbox.delete_directory(sandbox_path, recursive=True)
+
+        # Remove mount record
+        self.database.delete_mount(mount_to_remove.mount_id)
+
+        # Remove metadata
+        self.database.delete_metadata(mount_path)
+
+        return ToolResult(
+            status="success",
+            message=f"Unmounted: {mount_path}",
+        )
+
+    def _remount_saved_mounts(self) -> None:
+        """
+        Remount previously mounted folders. Called during spinup.
+        """
+        if not self.config.agent_id:
+            return
+
+        mounts = self.database.get_mounts_for_agent(self.config.agent_id)
+
+        for mount in mounts:
+            if mount.source_type == MountSourceType.AGENT:
+                # Get source agent's persistent memory
+                source_persistent_path = self.config.sandbox.get_agent_persistent_path(
+                    mount.source_ref
+                )
+                source_memory_path = source_persistent_path / "memory"
+
+                if source_memory_path.exists():
+                    # Create mount point and copy
+                    sandbox_mount_path = mount.mount_path.lstrip("/")
+                    self.sandbox.create_directory(sandbox_mount_path)
+
+                    import shutil
+                    dest_path = Path(self.sandbox.root_path) / sandbox_mount_path
+                    if dest_path.exists():
+                        shutil.rmtree(dest_path)
+                    shutil.copytree(source_memory_path, dest_path)
+
+    def list_mounts(self) -> ToolResult:
+        """
+        List all current mounts for this agent.
+
+        Returns:
+            ToolResult with list of mounts
+        """
+        if not self.config.agent_id:
+            return ToolResult(
+                status="error",
+                message="No active session.",
+            )
+
+        mounts = self.database.get_mounts_for_agent(self.config.agent_id)
+
+        mount_list = []
+        for mount in mounts:
+            mount_info = {
+                "mount_path": mount.mount_path,
+                "source_type": mount.source_type.value,
+                "source_ref": mount.source_ref,
+            }
+
+            # Try to get source name for agent mounts
+            if mount.source_type == MountSourceType.AGENT:
+                source_agent = self.database.get_agent_by_id(mount.source_ref)
+                if source_agent:
+                    mount_info["source_name"] = source_agent.name
+
+            mount_list.append(mount_info)
+
+        return ToolResult(
+            status="success",
+            message=f"Found {len(mount_list)} mount(s)",
+            data={"mounts": mount_list},
+        )
 
     # =========================================================================
     # File Operations
@@ -381,7 +967,7 @@ class MemFS:
             metadata = NodeMetadata(
                 path=path,
                 node_type=NodeType.FILE,
-                owner=self.config.agent_id,
+                owner=self.config.agent_id or "system",
                 file_type=file_type,
                 description=description,
                 tags=tags or [],
@@ -629,7 +1215,7 @@ class MemFS:
             metadata = NodeMetadata(
                 path=path,
                 node_type=NodeType.FOLDER,
-                owner=self.config.agent_id,
+                owner=self.config.agent_id or "system",
                 description=description,
                 tags=tags or [],
             )
@@ -1316,7 +1902,7 @@ class MemFS:
         log = MemFSLog.create(
             operation=operation,
             path=path,
-            agent_id=self.config.agent_id,
+            agent_id=self.config.agent_id or "system",
             details=details or {},
         )
         self.database.save_log(log)
@@ -1333,7 +1919,7 @@ class MemFS:
             timestamp=time.time(),
             description=description,
             changed_paths=changed_paths,
-            agent_id=self.config.agent_id,
+            agent_id=self.config.agent_id or "system",
         )
         self.database.save_snapshot(snapshot)
 
@@ -1342,9 +1928,12 @@ class MemFS:
 # Factory Functions
 # =========================================================================
 
+
 def create_memfs(config: MemLearnConfig | None = None) -> MemFS:
     """
-    Create and initialize a new MemFS instance.
+    Create and initialize a new MemFS instance (ephemeral, no persistence).
+
+    For persistent sessions, use MemFS.for_agent() instead.
 
     Args:
         config: Optional configuration. Uses defaults if not provided.
@@ -1357,12 +1946,32 @@ def create_memfs(config: MemLearnConfig | None = None) -> MemFS:
     return memfs
 
 
+def load_agent(
+    agent_name: str,
+    config: MemLearnConfig | None = None,
+) -> MemFS:
+    """
+    Load a MemFS instance for an agent with persistence.
+
+    This is an alias for MemFS.for_agent().
+
+    Args:
+        agent_name: Unique name for the agent (e.g., "code-editor")
+        config: Optional configuration. Uses default_persistent() if not provided.
+
+    Returns:
+        MemFS instance with persistence enabled.
+    """
+    return MemFS.for_agent(agent_name, config)
+
+
+# Keep backward compatibility
 def load_memfs(
     agent_id: str | None = None,
     config: MemLearnConfig | None = None,
 ) -> MemFS:
     """
-    Load a MemFS instance, potentially from persistent storage.
+    Load a MemFS instance (deprecated - use load_agent() for persistence).
 
     Args:
         agent_id: Agent ID for loading specific memory.

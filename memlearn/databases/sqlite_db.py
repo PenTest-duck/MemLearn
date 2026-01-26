@@ -6,16 +6,22 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from typing import Any
 
 from memlearn.databases.base import BaseDatabase
 from memlearn.types import (
+    Agent,
     Chunk,
     FileType,
     MemFSLog,
+    MountInfo,
+    MountSourceType,
     NodeMetadata,
     NodeType,
     Permissions,
+    Session,
+    SessionStatus,
     Timestamps,
     VersionSnapshot,
 )
@@ -45,6 +51,42 @@ class SQLiteDatabase(BaseDatabase):
         assert self.conn is not None
 
         cursor = self.conn.cursor()
+
+        # Agents table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agents (
+                agent_id TEXT PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                created_at REAL NOT NULL,
+                extra TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+
+        # Sessions table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                status TEXT NOT NULL DEFAULT 'active',
+                extra TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY (agent_id) REFERENCES agents(agent_id)
+            )
+        """)
+
+        # Mounts table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS mounts (
+                mount_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                mount_path TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (agent_id) REFERENCES agents(agent_id)
+            )
+        """)
 
         # Node metadata table
         cursor.execute("""
@@ -96,6 +138,18 @@ class SQLiteDatabase(BaseDatabase):
 
         # Create indexes
         cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agents_name ON agents(name)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mounts_agent_id ON mounts(agent_id)"
+        )
+        cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp DESC)"
         )
         cursor.execute(
@@ -112,6 +166,300 @@ class SQLiteDatabase(BaseDatabase):
         if self.conn:
             self.conn.close()
             self.conn = None
+
+    # =========================================================================
+    # Agent operations
+    # =========================================================================
+
+    def create_agent(self, agent: Agent) -> None:
+        """Create a new agent."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO agents (agent_id, name, created_at, extra)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                agent.agent_id,
+                agent.name,
+                agent.created_at,
+                json.dumps(agent.extra),
+            ),
+        )
+        self.conn.commit()
+
+    def get_agent_by_id(self, agent_id: str) -> Agent | None:
+        """Get an agent by ID."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,))
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return Agent(
+            agent_id=row["agent_id"],
+            name=row["name"],
+            created_at=row["created_at"],
+            extra=json.loads(row["extra"]),
+        )
+
+    def get_agent_by_name(self, name: str) -> Agent | None:
+        """Get an agent by name."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM agents WHERE name = ?", (name,))
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return Agent(
+            agent_id=row["agent_id"],
+            name=row["name"],
+            created_at=row["created_at"],
+            extra=json.loads(row["extra"]),
+        )
+
+    def list_agents(self) -> list[Agent]:
+        """List all agents."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM agents ORDER BY created_at DESC")
+
+        return [
+            Agent(
+                agent_id=row["agent_id"],
+                name=row["name"],
+                created_at=row["created_at"],
+                extra=json.loads(row["extra"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def delete_agent(self, agent_id: str) -> bool:
+        """Delete an agent. Returns True if deleted."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM agents WHERE agent_id = ?", (agent_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    # =========================================================================
+    # Session operations
+    # =========================================================================
+
+    def create_session(self, session: Session) -> None:
+        """Create a new session."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO sessions (session_id, agent_id, started_at, ended_at, status, extra)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session.session_id,
+                session.agent_id,
+                session.started_at,
+                session.ended_at,
+                session.status.value,
+                json.dumps(session.extra),
+            ),
+        )
+        self.conn.commit()
+
+    def get_session(self, session_id: str) -> Session | None:
+        """Get a session by ID."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return Session(
+            session_id=row["session_id"],
+            agent_id=row["agent_id"],
+            started_at=row["started_at"],
+            ended_at=row["ended_at"],
+            status=SessionStatus(row["status"]),
+            extra=json.loads(row["extra"]),
+        )
+
+    def update_session(self, session: Session) -> None:
+        """Update an existing session."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE sessions
+            SET started_at = ?, ended_at = ?, status = ?, extra = ?
+            WHERE session_id = ?
+            """,
+            (
+                session.started_at,
+                session.ended_at,
+                session.status.value,
+                json.dumps(session.extra),
+                session.session_id,
+            ),
+        )
+        self.conn.commit()
+
+    def end_session(
+        self, session_id: str, status: SessionStatus = SessionStatus.COMPLETED
+    ) -> None:
+        """End a session with the given status."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE sessions
+            SET ended_at = ?, status = ?
+            WHERE session_id = ?
+            """,
+            (time.time(), status.value, session_id),
+        )
+        self.conn.commit()
+
+    def get_sessions_for_agent(
+        self, agent_id: str, limit: int = 50
+    ) -> list[Session]:
+        """Get sessions for an agent, most recent first."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM sessions
+            WHERE agent_id = ?
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (agent_id, limit),
+        )
+
+        return [
+            Session(
+                session_id=row["session_id"],
+                agent_id=row["agent_id"],
+                started_at=row["started_at"],
+                ended_at=row["ended_at"],
+                status=SessionStatus(row["status"]),
+                extra=json.loads(row["extra"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def get_active_session_for_agent(self, agent_id: str) -> Session | None:
+        """Get the currently active session for an agent, if any."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM sessions
+            WHERE agent_id = ? AND status = 'active'
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (agent_id,),
+        )
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return Session(
+            session_id=row["session_id"],
+            agent_id=row["agent_id"],
+            started_at=row["started_at"],
+            ended_at=row["ended_at"],
+            status=SessionStatus(row["status"]),
+            extra=json.loads(row["extra"]),
+        )
+
+    # =========================================================================
+    # Mount operations
+    # =========================================================================
+
+    def create_mount(self, mount: MountInfo) -> None:
+        """Create a new mount record."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO mounts (mount_id, agent_id, mount_path, source_type, source_ref, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mount.mount_id,
+                mount.agent_id,
+                mount.mount_path,
+                mount.source_type.value,
+                mount.source_ref,
+                mount.created_at,
+            ),
+        )
+        self.conn.commit()
+
+    def get_mounts_for_agent(self, agent_id: str) -> list[MountInfo]:
+        """Get all mounts for an agent."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT * FROM mounts WHERE agent_id = ? ORDER BY created_at",
+            (agent_id,),
+        )
+
+        return [
+            MountInfo(
+                mount_id=row["mount_id"],
+                agent_id=row["agent_id"],
+                mount_path=row["mount_path"],
+                source_type=MountSourceType(row["source_type"]),
+                source_ref=row["source_ref"],
+                created_at=row["created_at"],
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def delete_mount(self, mount_id: str) -> bool:
+        """Delete a mount record. Returns True if deleted."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM mounts WHERE mount_id = ?", (mount_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def delete_mounts_for_agent(self, agent_id: str) -> int:
+        """Delete all mounts for an agent. Returns count deleted."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM mounts WHERE agent_id = ?", (agent_id,))
+        self.conn.commit()
+        return cursor.rowcount
+
+    # =========================================================================
+    # Helper methods
+    # =========================================================================
 
     def _serialize_embedding(self, embedding: list[float] | None) -> str | None:
         """Serialize embedding to JSON string."""

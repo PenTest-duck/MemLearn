@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 # Provider type definitions
@@ -15,6 +16,9 @@ EmbedderProvider = Literal["openai", "voyage", "gemini"]
 RerankerProvider = Literal["cohere", "none"]
 SandboxProvider = Literal["local", "e2b"]
 AgentProvider = Literal["openai", "anthropic", "gemini"]
+
+# Default paths
+DEFAULT_MEMLEARN_HOME = Path.home() / ".memlearn"
 
 
 @dataclass
@@ -72,9 +76,22 @@ class SandboxConfig:
     provider: SandboxProvider = "local"
     # Local
     temp_dir_prefix: str = "memfs-"
+    # Persistent storage path for syncing between sessions
+    # Default: ~/.memlearn/persistent
+    persistent_storage_path: str | None = None
     # E2B
     e2b_api_key: str | None = None
     e2b_template: str = "base"
+
+    def get_persistent_storage_path(self) -> Path:
+        """Get the persistent storage path, using default if not set."""
+        if self.persistent_storage_path:
+            return Path(self.persistent_storage_path)
+        return DEFAULT_MEMLEARN_HOME / "persistent"
+
+    def get_agent_persistent_path(self, agent_id: str) -> Path:
+        """Get the persistent storage path for a specific agent."""
+        return self.get_persistent_storage_path() / "agents" / agent_id
 
 
 @dataclass
@@ -102,11 +119,16 @@ class MemLearnConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
 
-    # Session settings
-    agent_id: str = "default"
+    # Session settings (set during spinup)
+    agent_id: str | None = None
     session_id: str | None = None
+    agent_name: str | None = None
     auto_embed: bool = True
     auto_log: bool = True
+
+    def get_memlearn_home(self) -> Path:
+        """Get the MemLearn home directory."""
+        return DEFAULT_MEMLEARN_HOME
 
     @classmethod
     def from_env(cls) -> "MemLearnConfig":
@@ -122,7 +144,7 @@ class MemLearnConfig:
 
     @classmethod
     def default_local(cls) -> "MemLearnConfig":
-        """Create a default local configuration for development."""
+        """Create a default local configuration for development (in-memory, no persistence)."""
         return cls(
             database=DatabaseConfig(provider="sqlite", sqlite_path=None),
             vector_store=VectorStoreConfig(provider="chroma", chroma_path=None),
@@ -135,5 +157,39 @@ class MemLearnConfig:
                 api_key=os.getenv("COHERE_API_KEY"),
             ),
             sandbox=SandboxConfig(provider="local"),
+            agent=AgentConfig(provider="openai"),
+        )
+
+    @classmethod
+    def default_persistent(cls) -> "MemLearnConfig":
+        """Create a default configuration with persistence enabled.
+
+        Uses ~/.memlearn/ for all persistent storage:
+        - ~/.memlearn/memlearn.db (SQLite database)
+        - ~/.memlearn/chroma/ (Vector store)
+        - ~/.memlearn/persistent/agents/{agent_id}/ (Agent filesystems)
+        """
+        home = DEFAULT_MEMLEARN_HOME
+        return cls(
+            database=DatabaseConfig(
+                provider="sqlite",
+                sqlite_path=str(home / "memlearn.db"),
+            ),
+            vector_store=VectorStoreConfig(
+                provider="chroma",
+                chroma_path=str(home / "chroma"),
+            ),
+            embedder=EmbedderConfig(
+                provider="openai",
+                api_key=os.getenv("OPENAI_API_KEY"),
+            ),
+            reranker=RerankerConfig(
+                provider="cohere",
+                api_key=os.getenv("COHERE_API_KEY"),
+            ),
+            sandbox=SandboxConfig(
+                provider="local",
+                persistent_storage_path=str(home / "persistent"),
+            ),
             agent=AgentConfig(provider="openai"),
         )

@@ -4,10 +4,20 @@ MemLearn - An open-source agentic memory and continual learning system.
 MemLearn provides a filesystem-like architecture (MemFS) for LLM agents to
 store, manage, and retrieve memory with semantic search capabilities.
 
-Basic Usage:
+Persistent Agent Usage (Recommended):
+    from memlearn import MemFS
+    from memlearn.tools import OpenAIToolProvider
+
+    # Use context manager for automatic persistence
+    with MemFS.for_agent("code-editor") as memfs:
+        tools = OpenAIToolProvider(memfs)
+        # ... run agent session ...
+    # Automatically persists and cleans up
+
+Ephemeral Usage (No persistence):
     from memlearn import create_memfs, get_openai_tools, execute_openai_tool
 
-    # Create and initialize MemFS
+    # Create ephemeral MemFS (for testing/development)
     memfs = create_memfs()
 
     # Get tools for your agent
@@ -18,17 +28,10 @@ Basic Usage:
 
     # Clean up when done
     memfs.close()
-
-Context Manager Usage:
-    from memlearn import MemFS
-
-    with MemFS() as memfs:
-        # Use memfs...
-        memfs.create_file("/memory/test.md", "Hello, World!")
 """
 
 from memlearn.config import MemLearnConfig
-from memlearn.memfs import MemFS, create_memfs, load_memfs
+from memlearn.memfs import MemFS, create_memfs, load_agent, load_memfs
 from memlearn.prompts import (
     MEMFS_SYSTEM_PROMPT,
     get_custom_memfs_prompt,
@@ -36,13 +39,20 @@ from memlearn.prompts import (
 )
 from memlearn.tools import execute_openai_tool, get_openai_tools
 from memlearn.types import (
+    Agent,
     Chunk,
+    CompactionMarker,
+    ConversationHistory,
     FileType,
     MemFSLog,
+    MountInfo,
+    MountSourceType,
     NodeMetadata,
     NodeType,
     Permissions,
     SearchResult,
+    Session,
+    SessionStatus,
     Timestamps,
     ToolResult,
     VersionSnapshot,
@@ -57,6 +67,7 @@ __all__ = [
     # Factory functions
     "create_memfs",
     "load_memfs",
+    "load_agent",
     # Tool helpers
     "get_openai_tools",
     "execute_openai_tool",
@@ -64,7 +75,15 @@ __all__ = [
     "MEMFS_SYSTEM_PROMPT",
     "get_memfs_system_prompt",
     "get_custom_memfs_prompt",
-    # Types
+    # Entity types
+    "Agent",
+    "Session",
+    "SessionStatus",
+    "MountInfo",
+    "MountSourceType",
+    "ConversationHistory",
+    "CompactionMarker",
+    # MemFS types
     "NodeMetadata",
     "NodeType",
     "FileType",
