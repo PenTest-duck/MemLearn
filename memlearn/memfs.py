@@ -21,6 +21,8 @@ from memlearn.databases.base import BaseDatabase
 from memlearn.databases.sqlite_db import SQLiteDatabase
 from memlearn.embedders.base import BaseEmbedder
 from memlearn.embedders.openai_embedder import OpenAIEmbedder
+from memlearn.llms.base import BaseLLM
+from memlearn.llms.openai_llm import OpenAILLM
 from memlearn.rerankers.base import BaseReranker, NoOpReranker
 from memlearn.rerankers.cohere_reranker import CohereReranker
 from memlearn.sandboxes.base import BaseSandbox
@@ -109,6 +111,7 @@ class MemFS:
         embedder: BaseEmbedder | None = None,
         vector_store: BaseVectorStore | None = None,
         reranker: BaseReranker | None = None,
+        llm: BaseLLM | None = None,
     ):
         """
         Initialize MemFS.
@@ -120,6 +123,7 @@ class MemFS:
             embedder: Custom embedder implementation.
             vector_store: Custom vector store implementation.
             reranker: Custom reranker implementation.
+            llm: Custom LLM implementation for summarization and reflection.
         """
         self.config = config or MemLearnConfig.from_env()
 
@@ -129,6 +133,7 @@ class MemFS:
         self.embedder = embedder or self._create_embedder()
         self.vector_store = vector_store or self._create_vector_store()
         self.reranker = reranker or self._create_reranker()
+        self.llm = llm or self._create_llm()
 
         self._initialized = False
         self._version_counter = 0
@@ -160,13 +165,29 @@ class MemFS:
         """Create reranker based on config."""
         if self.config.reranker.provider == "none":
             return NoOpReranker()
-        
+
         if self.config.reranker.api_key:
             return CohereReranker(
                 api_key=self.config.reranker.api_key,
                 model=self.config.reranker.model,
             )
         return NoOpReranker()
+
+    def _create_llm(self) -> BaseLLM | None:
+        """Create LLM based on config."""
+        # Only create LLM if summarization is enabled
+        if not self.config.llm.summarize_on_spindown:
+            return None
+
+        if self.config.llm.provider == "openai":
+            return OpenAILLM(
+                api_key=self.config.llm.api_key,
+                model=self.config.llm.model,
+                default_max_tokens=self.config.llm.max_summary_tokens,
+            )
+
+        # Future: Add anthropic, gemini providers
+        return None
 
     def initialize(self) -> None:
         """Initialize MemFS and create default folder structure."""
@@ -187,9 +208,18 @@ class MemFS:
         # Create root directories
         root_dirs = [
             ("raw", Permissions(readable=True, writable=False, executable=False)),
-            ("raw/conversation-history", Permissions(readable=True, writable=False, executable=False)),
-            ("raw/artifacts", Permissions(readable=True, writable=False, executable=False)),
-            ("raw/skills", Permissions(readable=True, writable=False, executable=False)),
+            (
+                "raw/conversation-history",
+                Permissions(readable=True, writable=False, executable=False),
+            ),
+            (
+                "raw/artifacts",
+                Permissions(readable=True, writable=False, executable=False),
+            ),
+            (
+                "raw/skills",
+                Permissions(readable=True, writable=False, executable=False),
+            ),
             ("memory", Permissions(readable=True, writable=True, executable=False)),
             ("tmp", Permissions(readable=True, writable=True, executable=False)),
             ("mnt", Permissions(readable=True, writable=True, executable=False)),
@@ -297,9 +327,7 @@ class MemFS:
         # Check for any orphaned active sessions and end them
         active_session = self.database.get_active_session_for_agent(agent.agent_id)
         if active_session:
-            self.database.end_session(
-                active_session.session_id, SessionStatus.ABORTED
-            )
+            self.database.end_session(active_session.session_id, SessionStatus.ABORTED)
 
         # Create new session
         session = Session.create(agent_id=agent.agent_id)
@@ -339,10 +367,11 @@ class MemFS:
         End session and persist state.
 
         This will:
-        1. Archive conversation history (rename CURRENT to timestamp)
-        2. Sync sandbox to persistent storage
-        3. Update session record
-        4. Clean up ephemeral sandbox
+        1. Summarize conversation history using LLM (if enabled)
+        2. Archive conversation history (rename CURRENT to timestamp)
+        3. Sync sandbox to persistent storage
+        4. Update session record
+        5. Clean up ephemeral sandbox
 
         Args:
             status: Final session status (completed or aborted)
@@ -350,8 +379,13 @@ class MemFS:
         if not self._initialized:
             return
 
-        # Archive conversation history
-        self._archive_conversation_history()
+        # Generate conversation summary using LLM (if enabled and conversation exists)
+        conversation_summary = None
+        if self.config.llm.summarize_on_spindown and self.llm is not None:
+            conversation_summary = self._summarize_conversation()
+
+        # Archive conversation history (with summary in metadata)
+        self._archive_conversation_history(summary=conversation_summary)
 
         # Sync to persistent storage (excluding /tmp)
         if self.config.agent_id:
@@ -422,6 +456,52 @@ class MemFS:
     # Conversation History Methods
     # =========================================================================
 
+    def _summarize_conversation(self) -> str | None:
+        """
+        Generate a summary of the current conversation using the configured LLM.
+
+        Returns:
+            The conversation summary, or None if summarization failed or was skipped.
+        """
+        if self.llm is None:
+            return None
+
+        # Get the conversation messages
+        messages = self.get_conversation_history()
+        if not messages:
+            return None
+
+        try:
+            # Use the OpenAI LLM's specialized method if available
+            if hasattr(self.llm, "summarize_conversation"):
+                return self.llm.summarize_conversation(
+                    messages=messages,
+                    agent_name=self.config.agent_name,
+                    session_context=f"Session ID: {self.config.session_id}",
+                )
+
+            # Fallback to generic summarize method
+            # Build conversation text
+            conversation_parts = []
+            for msg in messages:
+                role = msg.get("role", "unknown").upper()
+                content = msg.get("content", "")
+                # Truncate very long messages
+                if len(content) > 2000:
+                    content = content[:2000] + "... [truncated]"
+                conversation_parts.append(f"{role}: {content}")
+
+            conversation_text = "\n\n".join(conversation_parts)
+
+            return self.llm.summarize(
+                content=conversation_text,
+                context=f"Agent conversation for '{self.config.agent_name}'",
+            )
+
+        except Exception:
+            # Don't fail spindown if summarization fails
+            return None
+
     def _init_conversation_history(self) -> None:
         """Create CURRENT.json with session metadata. Called during spinup."""
         if not self.config.session_id or not self.config.agent_id:
@@ -451,8 +531,13 @@ class MemFS:
         )
         self.database.save_metadata(metadata)
 
-    def _archive_conversation_history(self) -> None:
-        """Rename CURRENT.json to timestamp format. Called during spindown."""
+    def _archive_conversation_history(self, summary: str | None = None) -> None:
+        """
+        Archive CURRENT.json with optional LLM-generated summary.
+
+        Args:
+            summary: Optional conversation summary to store in metadata.
+        """
         current_path = "raw/conversation-history/CURRENT.json"
 
         if not self.sandbox.exists(current_path):
@@ -464,6 +549,13 @@ class MemFS:
             history_data = json.loads(content)
             started_at = history_data.get("started_at", time.time())
 
+            # Add summary to the history data if provided
+            if summary:
+                history_data["summary"] = summary
+                # Update the file with the summary included
+                content = json.dumps(history_data, indent=2)
+                self.sandbox.write_file(current_path, content)
+
             # Create timestamp filename (ISO format with safe characters)
             dt = datetime.datetime.fromtimestamp(started_at)
             timestamp_str = dt.strftime("%Y-%m-%dT%H-%M-%S")
@@ -473,7 +565,7 @@ class MemFS:
             # Rename the file
             self.sandbox.move(current_path, archive_path)
 
-            # Update metadata
+            # Update metadata with summary
             old_metadata = self.database.get_metadata(CONVERSATION_HISTORY_PATH)
             if old_metadata:
                 self.database.delete_metadata(CONVERSATION_HISTORY_PATH)
@@ -481,6 +573,13 @@ class MemFS:
                 old_metadata.description = (
                     f"Archived conversation history from {timestamp_str}"
                 )
+                # Store summary in metadata extra field
+                if summary:
+                    old_metadata.extra["summary"] = summary
+                    old_metadata.extra["summarized_at"] = time.time()
+                    old_metadata.extra["summary_model"] = (
+                        self.llm.model if self.llm else None
+                    )
                 self.database.save_metadata(old_metadata)
 
         except Exception:
@@ -680,6 +779,7 @@ class MemFS:
 
         # Copy the source memory into the mount point
         import shutil
+
         dest_path = Path(self.sandbox.root_path) / sandbox_mount_path
         if dest_path.exists():
             shutil.rmtree(dest_path)
@@ -781,6 +881,7 @@ class MemFS:
                     self.sandbox.create_directory(sandbox_mount_path)
 
                     import shutil
+
                     dest_path = Path(self.sandbox.root_path) / sandbox_mount_path
                     if dest_path.exists():
                         shutil.rmtree(dest_path)
@@ -877,11 +978,11 @@ class MemFS:
             # Apply line range
             start = (start_line or 1) - 1  # Convert to 0-indexed
             end = end_line or total_lines
-            
+
             # Clamp to valid range
             start = max(0, min(start, total_lines))
             end = max(start, min(end, total_lines))
-            
+
             selected_lines = lines[start:end]
 
             # Format output
@@ -1048,13 +1149,13 @@ class MemFS:
                 return ToolResult(
                     status="error",
                     message=f"String not found in file. The exact string to replace was not found in {path}. "
-                            "Make sure you're using the exact text including whitespace.",
+                    "Make sure you're using the exact text including whitespace.",
                 )
             if count > 1:
                 return ToolResult(
                     status="error",
                     message=f"String appears {count} times in file. Please provide a more unique string "
-                            "that includes surrounding context to ensure only one match.",
+                    "that includes surrounding context to ensure only one match.",
                 )
 
             # Perform replacement
@@ -1076,10 +1177,14 @@ class MemFS:
                 self.database.save_metadata(metadata)
 
             # Log and version
-            self._log_operation("edit_file", path, {
-                "old_length": len(old_string),
-                "new_length": len(new_string),
-            })
+            self._log_operation(
+                "edit_file",
+                path,
+                {
+                    "old_length": len(old_string),
+                    "new_length": len(new_string),
+                },
+            )
             self._create_version_snapshot(f"Edited file: {path}", [path])
 
             return ToolResult(
@@ -1223,11 +1328,15 @@ class MemFS:
             # Embed description if provided
             if self.config.auto_embed and description:
                 metadata.embedding = self.embedder.embed(description)
-                self._add_to_vector_store(path, metadata.embedding, {
-                    "path": path,
-                    "type": "folder",
-                    "description": description,
-                })
+                self._add_to_vector_store(
+                    path,
+                    metadata.embedding,
+                    {
+                        "path": path,
+                        "type": "folder",
+                        "description": description,
+                    },
+                )
 
             self.database.save_metadata(metadata)
 
@@ -1286,7 +1395,7 @@ class MemFS:
 
             for entry in entries:
                 meta = self.database.get_metadata(entry["path"])
-                
+
                 if entry["is_dir"]:
                     type_indicator = "📁"
                     size_info = f"{entry.get('child_count', 0)} items"
@@ -1325,7 +1434,7 @@ class MemFS:
     ) -> list[dict]:
         """Recursively list directory contents."""
         entries = []
-        
+
         try:
             items = self.sandbox.list_directory(path)
         except Exception:
@@ -1549,14 +1658,16 @@ class MemFS:
                 if meta and not any(t in meta.tags for t in tags):
                     continue
 
-            results.append(SearchResult(
-                path=vr.metadata.get("path", ""),
-                score=vr.score,
-                content_snippet=vr.metadata.get("content", ""),
-                chunk_index=vr.metadata.get("chunk_index"),
-                start_line=vr.metadata.get("start_line"),
-                end_line=vr.metadata.get("end_line"),
-            ))
+            results.append(
+                SearchResult(
+                    path=vr.metadata.get("path", ""),
+                    score=vr.score,
+                    content_snippet=vr.metadata.get("content", ""),
+                    chunk_index=vr.metadata.get("chunk_index"),
+                    start_line=vr.metadata.get("start_line"),
+                    end_line=vr.metadata.get("end_line"),
+                )
+            )
 
         return results
 
@@ -1600,13 +1711,15 @@ class MemFS:
                     end = min(len(lines), best_line_idx + 2)
                     snippet = "\n".join(lines[start:end])
 
-                    results.append(SearchResult(
-                        path=file_path,
-                        score=min(score, 1.0),
-                        content_snippet=snippet,
-                        start_line=start + 1,
-                        end_line=end,
-                    ))
+                    results.append(
+                        SearchResult(
+                            path=file_path,
+                            score=min(score, 1.0),
+                            content_snippet=snippet,
+                            start_line=start + 1,
+                            end_line=end,
+                        )
+                    )
 
             except Exception:
                 pass
@@ -1639,9 +1752,7 @@ class MemFS:
         if not results:
             return []
 
-        documents = [
-            f"{r.path}: {r.content_snippet or ''}" for r in results
-        ]
+        documents = [f"{r.path}: {r.content_snippet or ''}" for r in results]
 
         try:
             reranked = self.reranker.rerank(query, documents, top_n=top_k)
@@ -1649,14 +1760,16 @@ class MemFS:
             reranked_results = []
             for rr in reranked:
                 original = results[rr.index]
-                reranked_results.append(SearchResult(
-                    path=original.path,
-                    score=rr.score,
-                    content_snippet=original.content_snippet,
-                    chunk_index=original.chunk_index,
-                    start_line=original.start_line,
-                    end_line=original.end_line,
-                ))
+                reranked_results.append(
+                    SearchResult(
+                        path=original.path,
+                        score=rr.score,
+                        content_snippet=original.content_snippet,
+                        chunk_index=original.chunk_index,
+                        start_line=original.start_line,
+                        end_line=original.end_line,
+                    )
+                )
 
             return reranked_results
 
@@ -1700,7 +1813,9 @@ class MemFS:
         output_lines.append(f"  Type: {'folder' if metadata.is_folder else 'file'}")
         output_lines.append(f"  Owner: {metadata.owner}")
         output_lines.append(f"  Description: {metadata.description or '(none)'}")
-        output_lines.append(f"  Tags: {', '.join(metadata.tags) if metadata.tags else '(none)'}")
+        output_lines.append(
+            f"  Tags: {', '.join(metadata.tags) if metadata.tags else '(none)'}"
+        )
 
         if metadata.is_file:
             output_lines.append(f"  File type: {metadata.file_type.value}")
@@ -1796,6 +1911,7 @@ class MemFS:
     def _format_timestamp(self, ts: float) -> str:
         """Format timestamp to human readable."""
         import datetime
+
         dt = datetime.datetime.fromtimestamp(ts)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1820,13 +1936,15 @@ class MemFS:
             chunk = Chunk.from_content(chunk_text, start_line, end_line)
             metadata.chunks.append(chunk)
             chunk_texts.append(chunk_text)
-            chunk_metadata.append({
-                "path": metadata.path,
-                "chunk_index": i,
-                "start_line": start_line,
-                "end_line": end_line,
-                "content": chunk_text[:200],  # Store snippet for search results
-            })
+            chunk_metadata.append(
+                {
+                    "path": metadata.path,
+                    "chunk_index": i,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "content": chunk_text[:200],  # Store snippet for search results
+                }
+            )
 
         # Batch embed chunks
         if chunk_texts:
@@ -1843,7 +1961,13 @@ class MemFS:
             self.vector_store.add(
                 [f"{metadata.path}:description"],
                 [metadata.embedding],
-                [{"path": metadata.path, "type": "description", "content": metadata.description}],
+                [
+                    {
+                        "path": metadata.path,
+                        "type": "description",
+                        "content": metadata.description,
+                    }
+                ],
                 [metadata.description],
             )
 

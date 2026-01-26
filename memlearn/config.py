@@ -16,6 +16,7 @@ EmbedderProvider = Literal["openai", "voyage", "gemini"]
 RerankerProvider = Literal["cohere", "none"]
 SandboxProvider = Literal["local", "e2b"]
 AgentProvider = Literal["openai", "anthropic", "gemini"]
+LLMProvider = Literal["openai", "anthropic", "gemini"]
 
 # Default paths
 DEFAULT_MEMLEARN_HOME = Path.home() / ".memlearn"
@@ -108,6 +109,28 @@ class AgentConfig:
 
 
 @dataclass
+class LLMConfig:
+    """Configuration for the LLM provider used for internal tasks.
+
+    This configures the LLM used for MemFS internal operations like:
+    - Conversation summarization on spindown
+    - Memory reflection and consolidation (future)
+    - Automatic tagging and categorization (future)
+    """
+
+    provider: LLMProvider = "openai"
+    # Model for summarization and reflection tasks
+    model: str = "gpt-5-mini"
+    api_key: str | None = None
+    # Summarization settings
+    summarize_on_spindown: bool = True
+    max_summary_tokens: int = 1024
+    # Temperature for different task types
+    summarization_temperature: float = 0.3
+    reflection_temperature: float = 0.5
+
+
+@dataclass
 class MemLearnConfig:
     """Main configuration for MemLearn."""
 
@@ -118,6 +141,7 @@ class MemLearnConfig:
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
 
     # Session settings (set during spinup)
     agent_id: str | None = None
@@ -139,6 +163,7 @@ class MemLearnConfig:
         config.embedder.api_key = os.getenv("OPENAI_API_KEY")
         config.reranker.api_key = os.getenv("COHERE_API_KEY")
         config.sandbox.e2b_api_key = os.getenv("E2B_API_KEY")
+        config.llm.api_key = os.getenv("OPENAI_API_KEY")
 
         return config
 
@@ -158,6 +183,10 @@ class MemLearnConfig:
             ),
             sandbox=SandboxConfig(provider="local"),
             agent=AgentConfig(provider="openai"),
+            llm=LLMConfig(
+                provider="openai",
+                api_key=os.getenv("OPENAI_API_KEY"),
+            ),
         )
 
     @classmethod
@@ -192,4 +221,8 @@ class MemLearnConfig:
                 persistent_storage_path=str(home / "persistent"),
             ),
             agent=AgentConfig(provider="openai"),
+            llm=LLMConfig(
+                provider="openai",
+                api_key=os.getenv("OPENAI_API_KEY"),
+            ),
         )

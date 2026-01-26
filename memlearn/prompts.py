@@ -112,6 +112,69 @@ def get_memfs_system_prompt(extended: bool = False) -> str:
     return MEMFS_SYSTEM_PROMPT_EXTENDED if extended else MEMFS_SYSTEM_PROMPT
 
 
+# =============================================================================
+# Conversation Summarization Prompts
+# =============================================================================
+
+CONVERSATION_SUMMARY_SYSTEM_PROMPT = """You are an expert at summarizing agent conversations. Create a concise but comprehensive summary that captures:
+
+1. **Primary Task/Goal**: What was the main objective of this conversation?
+2. **Key Actions Taken**: What significant actions or decisions were made?
+3. **Outcomes**: What was accomplished? Were there any errors or issues?
+4. **Important Details**: Any specific files, data, or information that was worked with.
+5. **Learnings**: Any insights or patterns that might be useful for future sessions.
+
+Be concise but don't omit important details. The summary should be useful for understanding what happened in this session without reading the full conversation."""
+
+
+def get_conversation_summary_prompt(
+    conversation_text: str,
+    agent_name: str | None = None,
+    session_context: str | None = None,
+) -> tuple[str, str]:
+    """
+    Get the system and user prompts for conversation summarization.
+
+    Args:
+        conversation_text: The formatted conversation text to summarize.
+        agent_name: Optional name of the agent.
+        session_context: Optional additional context about the session.
+
+    Returns:
+        Tuple of (system_prompt, user_prompt).
+    """
+    system_prompt = CONVERSATION_SUMMARY_SYSTEM_PROMPT
+
+    if agent_name:
+        system_prompt += f"\n\nThe conversation involves an agent named '{agent_name}'."
+
+    if session_context:
+        system_prompt += f"\n\nAdditional context: {session_context}"
+
+    user_prompt = f"Please summarize this conversation:\n\n{conversation_text}"
+
+    return system_prompt, user_prompt
+
+
+# =============================================================================
+# Memory Reflection Prompts (Future Use)
+# =============================================================================
+
+MEMORY_REFLECTION_SYSTEM_PROMPT = """You are an expert at analyzing and consolidating knowledge from an agent's memory system. Your task is to:
+
+1. Identify patterns and recurring themes across memories
+2. Consolidate redundant or overlapping information
+3. Extract actionable insights and learnings
+4. Suggest organizational improvements
+
+Be thoughtful and preserve important nuances while eliminating redundancy."""
+
+
+# =============================================================================
+# Custom MemFS Prompt Builder
+# =============================================================================
+
+
 def get_custom_memfs_prompt(
     include_tools: bool = True,
     include_structure: bool = True,
