@@ -3,8 +3,8 @@ name = "playground"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
-dependencies = [
-    "dotenv>=0.9.9",
-    "openai>=2.15.0",
-]
+requires-python = ">=3.13"
+dependencies = ["chromadb>=0.3.23", "memlearn>=0.0.1", "python-dotenv>=1.2.1"]
+
+[tool.uv.sources]
+memlearn = { workspace = true }

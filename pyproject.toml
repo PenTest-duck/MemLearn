@@ -1,0 +1,7 @@
+[project]
+name = "memlearn-workspace"
+version = "0.1.0"
+description = "Add your description here"
+
+[tool.uv.workspace]
+members = ["memlearn", "playground"]
