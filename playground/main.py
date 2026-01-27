@@ -276,7 +276,9 @@ class PlaygroundSession:
 
         # Create MemFS with persistence
         self.memfs = MemFS.for_agent(self.agent_name, config)
-        self.tool_provider = OpenAIToolProvider(self.memfs, tool_prefix="memfs")
+        self.tool_provider = OpenAIToolProvider(
+            self.memfs, tool_prefix="memfs", enable_bash=True  # WARN: security issue
+        )
 
         # Initialize messages with system prompt
         system_prompt = get_system_prompt(self.agent_name)

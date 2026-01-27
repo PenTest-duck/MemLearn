@@ -5,25 +5,36 @@ OpenAI-compatible tool definitions for MemFS operations.
 from __future__ import annotations
 
 import json
+import subprocess
 from typing import Any
 
 from memlearn.memfs import MemFS
 from memlearn.tools.base import BaseToolProvider
+from memlearn.types import ToolResult
 
 
 class OpenAIToolProvider(BaseToolProvider):
     """OpenAI function calling compatible tool provider for MemFS."""
 
-    def __init__(self, memfs: MemFS, tool_prefix: str = "memfs"):
+    def __init__(
+        self,
+        memfs: MemFS,
+        tool_prefix: str = "memfs",
+        enable_bash: bool = False,
+    ):
         """
         Initialize the OpenAI tool provider.
 
         Args:
             memfs: The MemFS instance to operate on.
             tool_prefix: Prefix for tool names (e.g., "memfs_read").
+            enable_bash: Whether to enable the bash command execution tool.
+                WARNING: This allows arbitrary command execution within the
+                MemFS sandbox. Use with caution. Defaults to False.
         """
         super().__init__(memfs)
         self.tool_prefix = tool_prefix
+        self.enable_bash = enable_bash
 
     def _tool_name(self, name: str) -> str:
         """Generate full tool name with prefix."""
@@ -31,7 +42,7 @@ class OpenAIToolProvider(BaseToolProvider):
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Get OpenAI function calling compatible tool definitions."""
-        return [
+        tools = [
             # Read file
             {
                 "type": "function",
@@ -290,6 +301,38 @@ class OpenAIToolProvider(BaseToolProvider):
             },
         ]
 
+        # Conditionally add bash tool if enabled
+        if self.enable_bash:
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": self._tool_name("bash"),
+                        "description": "Execute a bash command within the MemFS sandbox. The command runs with the MemFS root as the working directory. Use this for tasks like running scripts, processing files, or performing operations that require shell commands. Commands are executed in a sandboxed environment.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "command": {
+                                    "type": "string",
+                                    "description": "The bash command to execute (e.g., 'ls -la', 'cat file.txt | grep pattern', 'python script.py')",
+                                },
+                                "timeout": {
+                                    "type": "integer",
+                                    "description": "Maximum execution time in seconds. Default is 30. Maximum is 300.",
+                                },
+                                "working_dir": {
+                                    "type": "string",
+                                    "description": "Working directory relative to MemFS root (e.g., '/memory/scripts'). Default is '/' (MemFS root).",
+                                },
+                            },
+                            "required": ["command"],
+                        },
+                    },
+                }
+            )
+
+        return tools
+
     def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """
         Execute a tool call and return the result as JSON string.
@@ -318,6 +361,10 @@ class OpenAIToolProvider(BaseToolProvider):
             "peek": self._execute_peek,
             "compact": self._execute_compact,
         }
+
+        # Add bash tool if enabled
+        if self.enable_bash:
+            tool_map["bash"] = self._execute_bash
 
         if tool_name not in tool_map:
             return json.dumps(
@@ -404,19 +451,137 @@ class OpenAIToolProvider(BaseToolProvider):
             preserve_last_n=args.get("preserve_last_n", 10),
         )
 
+    def _execute_bash(self, args: dict[str, Any]) -> ToolResult:
+        """
+        Execute a bash command within the MemFS sandbox.
 
-def get_openai_tools(memfs: MemFS, tool_prefix: str = "memfs") -> list[dict[str, Any]]:
+        Args:
+            args: Dictionary with 'command', optional 'timeout', and optional 'working_dir'.
+
+        Returns:
+            ToolResult with command output or error.
+        """
+        if not self.enable_bash:
+            return ToolResult(
+                status="error",
+                message="Bash execution is not enabled. Set enable_bash=True to enable.",
+            )
+
+        command = args.get("command", "")
+        if not command:
+            return ToolResult(
+                status="error",
+                message="No command provided.",
+            )
+
+        # Limit timeout to reasonable bounds
+        timeout = min(max(args.get("timeout", 30), 1), 300)
+
+        # Get working directory within sandbox
+        working_dir = args.get("working_dir", "/")
+        if working_dir.startswith("/"):
+            working_dir = working_dir[1:]
+
+        # Get sandbox root path
+        sandbox_root = self.memfs.sandbox.root_path
+
+        # Resolve working directory
+        import os
+
+        if working_dir:
+            cwd = os.path.normpath(os.path.join(sandbox_root, working_dir))
+        else:
+            cwd = sandbox_root
+
+        # Security: ensure working directory doesn't escape sandbox
+        if not cwd.startswith(sandbox_root):
+            return ToolResult(
+                status="error",
+                message=f"Working directory escapes sandbox: {working_dir}",
+            )
+
+        # Ensure working directory exists
+        if not os.path.isdir(cwd):
+            return ToolResult(
+                status="error",
+                message=f"Working directory does not exist: {working_dir}",
+            )
+
+        try:
+            # Execute the command
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                # Set environment to restrict some operations
+                env={
+                    **os.environ,
+                    "HOME": sandbox_root,
+                    "MEMFS_ROOT": sandbox_root,
+                },
+            )
+
+            # Combine stdout and stderr
+            output = ""
+            if result.stdout:
+                output += result.stdout
+            if result.stderr:
+                if output:
+                    output += "\n--- stderr ---\n"
+                output += result.stderr
+
+            # Truncate very long output
+            max_output_len = 50000
+            if len(output) > max_output_len:
+                output = output[:max_output_len] + f"\n... [truncated, {len(output) - max_output_len} chars omitted]"
+
+            return ToolResult(
+                status="success" if result.returncode == 0 else "error",
+                message=f"Command exited with code {result.returncode}",
+                data={
+                    "exit_code": result.returncode,
+                    "output": output,
+                    "command": command,
+                    "working_dir": working_dir or "/",
+                },
+            )
+
+        except subprocess.TimeoutExpired:
+            return ToolResult(
+                status="error",
+                message=f"Command timed out after {timeout} seconds.",
+                data={"command": command, "timeout": timeout},
+            )
+        except Exception as e:
+            return ToolResult(
+                status="error",
+                message=f"Failed to execute command: {str(e)}",
+                data={"command": command},
+            )
+
+
+def get_openai_tools(
+    memfs: MemFS,
+    tool_prefix: str = "memfs",
+    enable_bash: bool = False,
+) -> list[dict[str, Any]]:
     """
     Convenience function to get OpenAI-compatible tool definitions.
 
     Args:
         memfs: The MemFS instance.
         tool_prefix: Prefix for tool names.
+        enable_bash: Whether to enable the bash command execution tool.
+            WARNING: This allows arbitrary command execution within the
+            MemFS sandbox. Use with caution. Defaults to False.
 
     Returns:
         List of tool definitions for OpenAI function calling.
     """
-    provider = OpenAIToolProvider(memfs, tool_prefix)
+    provider = OpenAIToolProvider(memfs, tool_prefix, enable_bash=enable_bash)
     return provider.get_tool_definitions()
 
 
@@ -425,6 +590,7 @@ def execute_openai_tool(
     tool_name: str,
     arguments: dict[str, Any],
     tool_prefix: str = "memfs",
+    enable_bash: bool = False,
 ) -> str:
     """
     Convenience function to execute an OpenAI tool call.
@@ -434,9 +600,12 @@ def execute_openai_tool(
         tool_name: Name of the tool.
         arguments: Tool arguments.
         tool_prefix: Prefix for tool names.
+        enable_bash: Whether to enable the bash command execution tool.
+            WARNING: This allows arbitrary command execution within the
+            MemFS sandbox. Use with caution. Defaults to False.
 
     Returns:
         JSON string result.
     """
-    provider = OpenAIToolProvider(memfs, tool_prefix)
+    provider = OpenAIToolProvider(memfs, tool_prefix, enable_bash=enable_bash)
     return provider.execute_tool(tool_name, arguments)
