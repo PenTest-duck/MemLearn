@@ -83,6 +83,8 @@ class SandboxConfig:
     # E2B
     e2b_api_key: str | None = None
     e2b_template: str = "base"
+    # Version control - enables git-based versioning for undo support
+    version_control_enabled: bool = True
 
     def get_persistent_storage_path(self) -> Path:
         """Get the persistent storage path, using default if not set."""
@@ -114,6 +116,7 @@ class LLMConfig:
 
     This configures the LLM used for MemFS internal operations like:
     - Conversation summarization on spindown
+    - Memory note generation for system prompt injection
     - Memory reflection and consolidation (future)
     - Automatic tagging and categorization (future)
     """
@@ -124,7 +127,12 @@ class LLMConfig:
     api_key: str | None = None
     # Summarization settings
     summarize_on_spindown: bool = True
-    max_summary_tokens: int = 1024
+    max_summary_tokens: int = 16000  # Reasoning models need more tokens
+    # Memory note settings
+    # The memory note is a concise summary of what's stored in memory,
+    # auto-updated on spindown for injection into agent system prompts
+    update_memory_note_on_spindown: bool = True
+    memory_note_max_tokens: int = 8000  # Reasoning models need more tokens
     # Temperature for different task types
     summarization_temperature: float = 0.3
     reflection_temperature: float = 0.5
@@ -149,6 +157,9 @@ class MemLearnConfig:
     agent_name: str | None = None
     auto_embed: bool = True
     auto_log: bool = True
+
+    # Debug mode - enables verbose logging for diagnosing issues
+    debug: bool = False
 
     def get_memlearn_home(self) -> Path:
         """Get the MemLearn home directory."""

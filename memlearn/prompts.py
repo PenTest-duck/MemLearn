@@ -157,6 +157,60 @@ def get_conversation_summary_prompt(
 
 
 # =============================================================================
+# Memory Note Generation Prompts
+# =============================================================================
+
+MEMORY_NOTE_SYSTEM_PROMPT = """You are an expert at creating concise memory summaries for AI agents.
+
+Your task is to create a brief "memory note" that tells a future agent session what's currently stored in its persistent memory filesystem. This note will be injected into the agent's system prompt at the start of each session.
+
+Guidelines:
+1. Be CONCISE - keep the note brief and information-dense
+2. Focus on WHAT exists and WHERE to find it (file paths)
+3. Highlight the most important/useful stored information
+4. Mention both /memory/ (agent-created) and /raw/ (system-stored) contents
+5. If there's conversation history in /raw/conversation-history/, mention it
+6. Use a natural, helpful tone as if briefing your future self
+
+The note should help the agent quickly understand:
+- What knowledge/memories exist
+- Where important things are located
+- What sources to check for different types of information"""
+
+MEMORY_NOTE_USER_PROMPT_TEMPLATE = """Here is the current state of the memory filesystem:
+
+## Current Memory Note (may be outdated):
+{current_note}
+
+## Filesystem Listing:
+{fs_listing}
+
+Please generate an updated memory note that summarizes what's stored and where. If the memory is empty or nearly empty, say so briefly. If there's substantial content, highlight the key files and what they contain."""
+
+
+def get_memory_note_prompts(
+    current_note: str,
+    fs_listing: str,
+) -> tuple[str, str]:
+    """
+    Get the system and user prompts for memory note generation.
+
+    Args:
+        current_note: The current memory note (may be outdated).
+        fs_listing: The formatted filesystem listing.
+
+    Returns:
+        Tuple of (system_prompt, user_prompt).
+    """
+    system_prompt = MEMORY_NOTE_SYSTEM_PROMPT
+    user_prompt = MEMORY_NOTE_USER_PROMPT_TEMPLATE.format(
+        current_note=current_note,
+        fs_listing=fs_listing,
+    )
+    return system_prompt, user_prompt
+
+
+# =============================================================================
 # Memory Reflection Prompts (Future Use)
 # =============================================================================
 
@@ -173,6 +227,47 @@ Be thoughtful and preserve important nuances while eliminating redundancy."""
 # =============================================================================
 # Custom MemFS Prompt Builder
 # =============================================================================
+
+
+def get_memfs_system_prompt_with_note(
+    memory_note: str,
+    extended: bool = False,
+) -> str:
+    """
+    Get the MemFS system prompt with the dynamic memory note injected.
+
+    The memory note provides session-specific context about what's currently
+    stored in memory, helping the agent understand what knowledge is available
+    without needing to explore from scratch.
+
+    Args:
+        memory_note: The dynamic memory note describing current memory state.
+        extended: If True, use the extended system prompt version.
+
+    Returns:
+        Complete system prompt string with memory note section.
+
+    Example:
+        ```python
+        from memlearn import MemFS
+        from memlearn.prompts import get_memfs_system_prompt_with_note
+
+        with MemFS.for_agent("my-agent") as memfs:
+            memory_note = memfs.get_memory_note()
+            system_prompt = f'''You are a helpful assistant.
+
+            {get_memfs_system_prompt_with_note(memory_note)}
+            '''
+        ```
+    """
+    base_prompt = get_memfs_system_prompt(extended=extended)
+
+    memory_note_section = f"""
+### Current Memory State
+
+{memory_note}"""
+
+    return base_prompt + memory_note_section
 
 
 def get_custom_memfs_prompt(

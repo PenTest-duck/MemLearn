@@ -8,6 +8,7 @@ keywords = ["llm", "agents", "memory", "rag", "embeddings", "ai"]
 dependencies = [
     "chromadb>=1.4.1",
     "cohere>=5.20.2",
+    "langchain>=1.2.7",
     "openai>=2.15.0",
     "pydantic>=2.12.5",
 ]

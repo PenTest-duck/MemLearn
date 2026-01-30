@@ -1,15 +1,22 @@
 """
-MemLearn Playground - Multi-Agent Persistent Memory Demo
+MemLearn Playground - Multi-Agent Persistent Memory Demo (LangChain Edition)
 
 This playground demonstrates:
 1. Multi-agent support with persistent memory
 2. Session management and agent switching
 3. High observability into MemLearn operations
 4. Complex tasks that let agents discover memory tools organically
+5. Multi-model support via LangChain (OpenAI, Anthropic, Google, etc.)
 
 Usage:
     python playground/main.py           # Interactive menu
     python playground/main.py --demo    # Run automated demo
+
+Model Configuration:
+    Set MEMLEARN_MODEL env var or use 'model' command to switch:
+    - "openai:gpt-5.2" (default)
+    - "anthropic:claude-sonnet-4-20250514"
+    - "google_genai:gemini-2.5-pro"
 """
 
 import json
@@ -20,19 +27,25 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 
 # Add parent directory to path for local development
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from memlearn import MemFS, MemLearnConfig, get_memfs_system_prompt
-from memlearn.tools import OpenAIToolProvider
+from memlearn import MemFS, MemLearnConfig, get_memfs_system_prompt_with_note
+from memlearn.tools import LangChainToolProvider
 from memlearn.types import SessionStatus
 
 load_dotenv()
 
 # Configuration
-MODEL_NAME = "gpt-5.2"  # SOTA
+# Model format: "provider:model" e.g. "openai:gpt-5.2", "anthropic:claude-sonnet-4-20250514", "google_genai:gemini-2.5-pro"
+# Supported providers: openai, anthropic, google_genai, bedrock, azure_openai, etc.
+MODEL_NAME = os.getenv("MEMLEARN_MODEL", "openai:gpt-5.2")
 MEMLEARN_HOME = Path.home() / ".memlearn"
 
 
@@ -94,13 +107,54 @@ def print_warning(msg: str):
     print(f"{Colors.YELLOW}⚠ {msg}{Colors.RESET}")
 
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def get_model(model_string: str = MODEL_NAME):
+    """
+    Initialize a chat model from a model string.
+
+    Format: "provider:model" e.g.:
+    - "openai:gpt-5.2"
+    - "anthropic:claude-sonnet-4-20250514"
+    - "google_genai:gemini-2.5-pro"
+
+    Or just "model" which defaults to OpenAI.
+    """
+    return init_chat_model(model_string, streaming=True)
 
 
-def get_system_prompt(agent_name: str) -> str:
-    """Build a system prompt that's less prescriptive about memory tools."""
-    memfs_prompt = get_memfs_system_prompt(extended=True)
+def create_multiline_prompt_session() -> PromptSession:
+    """Create a prompt session that supports multi-line input.
+
+    Enter: Insert newline
+    Meta+Enter (Alt+Enter) or Escape then Enter: Submit
+    """
+    bindings = KeyBindings()
+
+    @bindings.add(Keys.Enter)
+    def _(event):
+        """Enter inserts a newline."""
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add(Keys.Escape, Keys.Enter)
+    def _(event):
+        """Escape + Enter submits the input."""
+        event.current_buffer.validate_and_handle()
+
+    @bindings.add("c-d")
+    def _(event):
+        """Ctrl+D also submits (common Unix pattern)."""
+        event.current_buffer.validate_and_handle()
+
+    return PromptSession(key_bindings=bindings, multiline=True)
+
+
+def get_system_prompt(agent_name: str, memory_note: str) -> str:
+    """Build a system prompt with dynamic memory note injection.
+
+    The memory note provides context about what's currently stored in memory,
+    helping the agent understand available knowledge without exploring from scratch.
+    """
+    # Use the new function that injects the memory note into the prompt
+    memfs_prompt = get_memfs_system_prompt_with_note(memory_note, extended=True)
 
     return f"""You are {agent_name}, an AI assistant with persistent memory.
 
@@ -113,6 +167,8 @@ You have access to a personal memory filesystem (MemFS) where you can store and 
 You have complete freedom in how you use your memory system. Some agents prefer detailed notes, others prefer structured data, some use it sparingly. Find what works for you.
 
 The key insight: your memory is YOUR tool. Use it when it helps you be more effective - for remembering context, tracking progress, storing insights, or building knowledge over time.
+
+When checking your memory, remember to look in BOTH /memory/ (your notes) AND /raw/ (system data like conversation history). The "Current Memory State" section above tells you what's available.
 
 Be natural, helpful, and thoughtful. Your memory is an extension of your capabilities."""
 
@@ -164,10 +220,9 @@ class MemLearnObserver:
             self._display_operation(entry)
 
     def _display_operation(self, entry: dict):
-        """Display a single operation with styling."""
+        """Display a single operation with full details."""
         tool = entry["tool"].replace("memfs_", "")
         status = entry["result"].get("status", "unknown")
-        message = entry["result"].get("message", "")
 
         # Color based on operation type
         tool_colors = {
@@ -183,48 +238,169 @@ class MemLearnObserver:
             "compact": Colors.YELLOW,
         }
         color = tool_colors.get(tool, Colors.WHITE)
+        status_color = Colors.GREEN if status == "success" else Colors.RED
+        status_icon = "✓" if status == "success" else "✗"
 
         # Build display
+        print(f"\n{Colors.GRAY}┌─ {entry['timestamp']} {'─' * 43}┐{Colors.RESET}")
         print(
-            f"\n{Colors.GRAY}┌─ {entry['timestamp']} ─────────────────────────────────────┐{Colors.RESET}"
+            f"{Colors.GRAY}│{Colors.RESET} {color}{Colors.BOLD}TOOL CALL: {entry['tool']}{Colors.RESET}"
         )
-        print(
-            f"{Colors.GRAY}│{Colors.RESET} {color}{Colors.BOLD}[{tool.upper()}]{Colors.RESET}"
-        )
+        print(f"{Colors.GRAY}│{Colors.RESET}")
 
-        # Show key arguments
+        # Show ALL arguments
         args = entry["args"]
-        if "path" in args:
-            print(
-                f"{Colors.GRAY}│{Colors.RESET}   Path: {Colors.WHITE}{args['path']}{Colors.RESET}"
-            )
-        if "query" in args:
-            print(
-                f"{Colors.GRAY}│{Colors.RESET}   Query: {Colors.WHITE}{args['query']}{Colors.RESET}"
-            )
-        if "content" in args:
-            content_preview = (
-                args["content"][:50] + "..."
-                if len(args.get("content", "")) > 50
-                else args.get("content", "")
-            )
-            print(
-                f"{Colors.GRAY}│{Colors.RESET}   Content: {Colors.DIM}{content_preview}{Colors.RESET}"
-            )
-
-        # Show result
-        if status == "success":
-            print(
-                f"{Colors.GRAY}│{Colors.RESET}   {Colors.GREEN}✓ {message}{Colors.RESET}"
-            )
+        print(f"{Colors.GRAY}│{Colors.RESET} {Colors.CYAN}Arguments:{Colors.RESET}")
+        if args:
+            for key, value in args.items():
+                # Format value based on type and length
+                if isinstance(value, str):
+                    if len(value) > 200:
+                        # Truncate long strings but show more than before
+                        formatted_value = (
+                            f'"{value[:200]}..." ({len(value)} chars total)'
+                        )
+                    elif "\n" in value:
+                        # Multi-line content - show with indentation
+                        lines = value.split("\n")
+                        if len(lines) > 10:
+                            preview_lines = lines[:10]
+                            formatted_value = (
+                                f'"""\n{Colors.GRAY}│{Colors.RESET}     '
+                                + f"\n{Colors.GRAY}│{Colors.RESET}     ".join(
+                                    preview_lines
+                                )
+                                + f'\n{Colors.GRAY}│{Colors.RESET}     ... ({len(lines)} lines total)\n{Colors.GRAY}│{Colors.RESET}   """'
+                            )
+                        else:
+                            formatted_value = (
+                                f'"""\n{Colors.GRAY}│{Colors.RESET}     '
+                                + f"\n{Colors.GRAY}│{Colors.RESET}     ".join(lines)
+                                + f'\n{Colors.GRAY}│{Colors.RESET}   """'
+                            )
+                    else:
+                        formatted_value = f'"{value}"'
+                elif isinstance(value, bool):
+                    formatted_value = f"{Colors.MAGENTA}{value}{Colors.RESET}"
+                elif isinstance(value, (int, float)):
+                    formatted_value = f"{Colors.YELLOW}{value}{Colors.RESET}"
+                else:
+                    formatted_value = json.dumps(value, indent=2)
+                    if "\n" in formatted_value:
+                        formatted_value = formatted_value.replace(
+                            "\n", f"\n{Colors.GRAY}│{Colors.RESET}     "
+                        )
+                print(
+                    f"{Colors.GRAY}│{Colors.RESET}   {Colors.WHITE}{key}{Colors.RESET}: {formatted_value}"
+                )
         else:
             print(
-                f"{Colors.GRAY}│{Colors.RESET}   {Colors.RED}✗ {message}{Colors.RESET}"
+                f"{Colors.GRAY}│{Colors.RESET}   {Colors.DIM}(no arguments){Colors.RESET}"
             )
 
+        print(f"{Colors.GRAY}│{Colors.RESET}")
         print(
-            f"{Colors.GRAY}└──────────────────────────────────────────────────────┘{Colors.RESET}"
+            f"{Colors.GRAY}│{Colors.RESET} {status_color}{status_icon} Result:{Colors.RESET}"
         )
+
+        # Show full result
+        result = entry["result"]
+        self._display_result_data(result)
+
+        print(f"{Colors.GRAY}└{'─' * 58}┘{Colors.RESET}")
+
+    def _display_result_data(self, result: dict, indent: int = 3):
+        """Display result data with proper formatting."""
+        indent_str = " " * indent
+
+        for key, value in result.items():
+            if key == "status":
+                continue  # Already shown in header
+
+            if isinstance(value, str):
+                if len(value) > 300:
+                    # Truncate very long strings
+                    print(
+                        f'{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}: "{value[:300]}..." ({len(value)} chars)'
+                    )
+                elif "\n" in value:
+                    lines = value.split("\n")
+                    if len(lines) > 15:
+                        print(
+                            f"{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}:"
+                        )
+                        for line in lines[:15]:
+                            print(
+                                f"{Colors.GRAY}│{Colors.RESET}{indent_str}  {Colors.DIM}{line}{Colors.RESET}"
+                            )
+                        print(
+                            f"{Colors.GRAY}│{Colors.RESET}{indent_str}  {Colors.DIM}... ({len(lines)} lines total){Colors.RESET}"
+                        )
+                    else:
+                        print(
+                            f"{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}:"
+                        )
+                        for line in lines:
+                            print(
+                                f"{Colors.GRAY}│{Colors.RESET}{indent_str}  {Colors.DIM}{line}{Colors.RESET}"
+                            )
+                else:
+                    print(
+                        f'{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}: "{value}"'
+                    )
+            elif isinstance(value, bool):
+                print(
+                    f"{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}: {Colors.MAGENTA}{value}{Colors.RESET}"
+                )
+            elif isinstance(value, (int, float)):
+                print(
+                    f"{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}: {Colors.YELLOW}{value}{Colors.RESET}"
+                )
+            elif isinstance(value, list):
+                print(
+                    f"{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}: ["
+                )
+                for i, item in enumerate(value[:10]):  # Limit to first 10 items
+                    if isinstance(item, dict):
+                        # Compact dict display for list items
+                        item_str = json.dumps(item, separators=(",", ":"))
+                        if len(item_str) > 80:
+                            item_str = item_str[:80] + "..."
+                        print(
+                            f"{Colors.GRAY}│{Colors.RESET}{indent_str}    {Colors.DIM}{item_str}{Colors.RESET}"
+                        )
+                    else:
+                        print(
+                            f"{Colors.GRAY}│{Colors.RESET}{indent_str}    {Colors.DIM}{item}{Colors.RESET}"
+                        )
+                if len(value) > 10:
+                    print(
+                        f"{Colors.GRAY}│{Colors.RESET}{indent_str}    {Colors.DIM}... ({len(value)} items total){Colors.RESET}"
+                    )
+                print(f"{Colors.GRAY}│{Colors.RESET}{indent_str}]")
+            elif isinstance(value, dict):
+                print(
+                    f"{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}:"
+                )
+                for k, v in list(value.items())[:10]:
+                    v_str = str(v)
+                    if len(v_str) > 60:
+                        v_str = v_str[:60] + "..."
+                    print(
+                        f"{Colors.GRAY}│{Colors.RESET}{indent_str}    {Colors.DIM}{k}: {v_str}{Colors.RESET}"
+                    )
+                if len(value) > 10:
+                    print(
+                        f"{Colors.GRAY}│{Colors.RESET}{indent_str}    {Colors.DIM}... ({len(value)} keys total){Colors.RESET}"
+                    )
+            elif value is None:
+                print(
+                    f"{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}: {Colors.DIM}null{Colors.RESET}"
+                )
+            else:
+                print(
+                    f"{Colors.GRAY}│{Colors.RESET}{indent_str}{Colors.WHITE}{key}{Colors.RESET}: {value}"
+                )
 
     def display_stats(self):
         """Display session statistics."""
@@ -257,12 +433,19 @@ class MemLearnObserver:
 class PlaygroundSession:
     """Manages a single agent session."""
 
-    def __init__(self, agent_name: str, observer: MemLearnObserver):
+    def __init__(
+        self,
+        agent_name: str,
+        observer: MemLearnObserver,
+        model_string: str = MODEL_NAME,
+    ):
         self.agent_name = agent_name
         self.observer = observer
+        self.model_string = model_string
         self.memfs = None
         self.tool_provider = None
-        self.messages = []
+        self.model = None
+        self.messages = []  # LangChain message objects
         self.turn_count = 0
 
     def start(self):
@@ -270,31 +453,51 @@ class PlaygroundSession:
         print(
             f"\n{Colors.CYAN}Starting session for {Colors.BOLD}{self.agent_name}{Colors.RESET}{Colors.CYAN}...{Colors.RESET}"
         )
+        print(f"  {Colors.GRAY}Model: {self.model_string}{Colors.RESET}")
 
-        # Use persistent config
+        # Use persistent config with debug enabled
         config = MemLearnConfig.default_persistent()
+        config.debug = True
 
-        # Create MemFS with persistence
-        self.memfs = MemFS.for_agent(self.agent_name, config)
-        self.tool_provider = OpenAIToolProvider(
-            self.memfs, tool_prefix="memfs", enable_bash=True  # WARN: security issue
+        # Create MemFS with persistence (read_only=False for full read-write access)
+        self.memfs = MemFS.for_agent(self.agent_name, config, read_only=False)
+        self.tool_provider = self.memfs.get_tool_provider(
+            enable_bash=True  # WARN: security issue - allows arbitrary shell commands
         )
 
-        # Initialize messages with system prompt
-        system_prompt = get_system_prompt(self.agent_name)
-        self.messages = [{"role": "system", "content": system_prompt}]
+        # Initialize the LangChain model with tools bound
+        self.model = get_model(self.model_string)
+        tools = self.tool_provider.get_tools()
+        self.model = self.model.bind_tools(tools)
+
+        # Get the dynamic memory note for system prompt injection
+        memory_note = self.memfs.get_memory_note()
+
+        # Initialize messages with system prompt (includes memory note)
+        system_prompt = get_system_prompt(self.agent_name, memory_note)
+        self.messages = [SystemMessage(content=system_prompt)]
 
         print_success(f"Session started")
         print_info("Agent ID", self.memfs.config.agent_id or "N/A")
         print_info("Session ID", self.memfs.config.session_id or "N/A")
         print_info("Sandbox", self.memfs.sandbox.root_path)
 
-        # Show any existing memory
-        self._show_memory_status()
+        # Show the memory note and status
+        self._show_memory_status(memory_note)
 
-    def _show_memory_status(self):
-        """Display current memory filesystem status."""
+    def _show_memory_status(self, memory_note: str | None = None):
+        """Display current memory filesystem status including the dynamic memory note."""
         print_subheader("Memory Status")
+
+        # Display the dynamic memory note
+        if memory_note:
+            print(
+                f"  {Colors.CYAN}{Colors.BOLD}Memory Note (injected into system prompt):{Colors.RESET}"
+            )
+            # Indent and wrap the note nicely
+            for line in memory_note.split("\n"):
+                print(f"  {Colors.WHITE}{line}{Colors.RESET}")
+            print()
 
         try:
             # List /memory contents
@@ -329,9 +532,9 @@ class PlaygroundSession:
             self.memfs = None
 
     def chat_turn(self, user_input: str, max_tool_rounds: int = 15):
-        """Execute a single chat turn."""
+        """Execute a single chat turn using LangChain streaming."""
         self.turn_count += 1
-        self.messages.append({"role": "user", "content": user_input})
+        self.messages.append(HumanMessage(content=user_input))
 
         # Record in conversation history
         if self.memfs:
@@ -339,36 +542,27 @@ class PlaygroundSession:
                 {"role": "user", "content": user_input}
             )
 
-        tools = self.tool_provider.get_tool_definitions()
-
         for round_num in range(max_tool_rounds):
-            content, tool_calls, usage_info = self._stream_response(tools)
+            ai_message, usage_info = self._stream_response()
 
-            # Build assistant message
-            assistant_msg = {"role": "assistant", "content": content}
-            if tool_calls and any(tc["id"] for tc in tool_calls):
-                assistant_msg["tool_calls"] = tool_calls
-            self.messages.append(assistant_msg)
+            # Add the AI message to our messages
+            self.messages.append(ai_message)
 
             # Record in conversation history
-            if self.memfs and content:
+            if self.memfs and ai_message.content:
                 self.memfs.append_conversation_message(
-                    {"role": "assistant", "content": content}
+                    {"role": "assistant", "content": ai_message.content}
                 )
 
             # Check if we have tool calls
-            active_tool_calls = [tc for tc in tool_calls if tc.get("id")]
-            if not active_tool_calls:
+            if not ai_message.tool_calls:
                 self._display_usage(usage_info)
                 break
 
             # Execute tool calls
-            for tool_call in active_tool_calls:
-                tool_name = tool_call["function"]["name"]
-                try:
-                    arguments = json.loads(tool_call["function"]["arguments"])
-                except json.JSONDecodeError:
-                    arguments = {}
+            for tool_call in ai_message.tool_calls:
+                tool_name = tool_call["name"]
+                arguments = tool_call["args"]
 
                 # Execute and observe
                 result_str = self.tool_provider.execute_tool(tool_name, arguments)
@@ -380,28 +574,19 @@ class PlaygroundSession:
                 # Log to observer
                 self.observer.log_tool_call(tool_name, arguments, result_data)
 
-                # Add to messages
+                # Add tool result to messages
                 self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": result_str,
-                    }
+                    ToolMessage(
+                        content=result_str,
+                        tool_call_id=tool_call["id"],
+                    )
                 )
 
-    def _stream_response(self, tools: list) -> tuple[str, list, dict | None]:
-        """Stream response from the model."""
-        stream = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=self.messages,
-            tools=tools,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-
+    def _stream_response(self) -> tuple[AIMessage, dict | None]:
+        """Stream response from the LangChain model."""
         full_content = ""
         tool_calls = []
-        current_tool_call = None
+        tool_call_chunks = {}  # Track tool call chunks by index
         usage_info = None
 
         print(
@@ -410,55 +595,80 @@ class PlaygroundSession:
             flush=True,
         )
 
-        for chunk in stream:
-            if chunk.usage is not None:
-                usage_info = {
-                    "prompt_tokens": chunk.usage.prompt_tokens,
-                    "completion_tokens": chunk.usage.completion_tokens,
-                    "total_tokens": chunk.usage.total_tokens,
-                }
+        for chunk in self.model.stream(self.messages):
+            # Handle content streaming
+            if chunk.content:
+                print(chunk.content, end="", flush=True)
+                full_content += chunk.content
 
-            if not chunk.choices:
-                continue
+            # Handle tool call chunks - they arrive progressively
+            if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                for tc_chunk in chunk.tool_call_chunks:
+                    idx = tc_chunk.get("index", 0)
 
-            delta = chunk.choices[0].delta
+                    if idx not in tool_call_chunks:
+                        tool_call_chunks[idx] = {
+                            "id": "",
+                            "name": "",
+                            "args": "",
+                        }
 
-            if delta.content:
-                print(delta.content, end="", flush=True)
-                full_content += delta.content
+                    if tc_chunk.get("id"):
+                        tool_call_chunks[idx]["id"] = tc_chunk["id"]
+                    if tc_chunk.get("name"):
+                        tool_call_chunks[idx]["name"] = tc_chunk["name"]
+                    if tc_chunk.get("args"):
+                        tool_call_chunks[idx]["args"] += tc_chunk["args"]
 
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    if tc_delta.index is not None:
-                        while len(tool_calls) <= tc_delta.index:
-                            tool_calls.append(
-                                {
-                                    "id": "",
-                                    "type": "function",
-                                    "function": {"name": "", "arguments": ""},
-                                }
-                            )
-                        current_tool_call = tool_calls[tc_delta.index]
-
-                    if tc_delta.id:
-                        current_tool_call["id"] = tc_delta.id
-
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            current_tool_call["function"][
-                                "name"
-                            ] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            current_tool_call["function"][
-                                "arguments"
-                            ] += tc_delta.function.arguments
+            # Try to extract usage info from response metadata
+            if hasattr(chunk, "response_metadata") and chunk.response_metadata:
+                meta = chunk.response_metadata
+                if "usage" in meta:
+                    usage = meta["usage"]
+                    usage_info = {
+                        "prompt_tokens": usage.get(
+                            "prompt_tokens", usage.get("input_tokens", 0)
+                        ),
+                        "completion_tokens": usage.get(
+                            "completion_tokens", usage.get("output_tokens", 0)
+                        ),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    }
+                # OpenAI-style token usage
+                if "token_usage" in meta:
+                    usage = meta["token_usage"]
+                    usage_info = {
+                        "prompt_tokens": usage.get("prompt_tokens", 0),
+                        "completion_tokens": usage.get("completion_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    }
 
         print()
-        return full_content, tool_calls, usage_info
+
+        # Build final tool calls list from accumulated chunks
+        for idx in sorted(tool_call_chunks.keys()):
+            tc = tool_call_chunks[idx]
+            if tc["id"] and tc["name"]:
+                try:
+                    args = json.loads(tc["args"]) if tc["args"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                tool_calls.append(
+                    {
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "args": args,
+                    }
+                )
+
+        # Create AIMessage with content and tool calls
+        ai_message = AIMessage(content=full_content, tool_calls=tool_calls)
+        return ai_message, usage_info
 
     def _display_usage(self, usage_info: dict | None):
         """Display token usage."""
         if not usage_info:
+            print(f"{Colors.DIM}[Turn {self.turn_count}]{Colors.RESET}")
             return
         print(
             f"{Colors.DIM}[Turn {self.turn_count} | Tokens: {usage_info.get('total_tokens', '?')} (in: {usage_info.get('prompt_tokens', '?')}, out: {usage_info.get('completion_tokens', '?')})]{Colors.RESET}"
@@ -575,7 +785,7 @@ start a NEW session with the SAME agent to see if it remembers.{Colors.RESET}
 
     # First session
     print_header(f"Session 1 with '{agent_name}'", Colors.GREEN)
-    session = PlaygroundSession(agent_name, observer)
+    session = PlaygroundSession(agent_name, observer, model_string=MODEL_NAME)
     session.start()
 
     try:
@@ -613,7 +823,7 @@ start a NEW session with the SAME agent to see if it remembers.{Colors.RESET}
     print_header(f"Session 2 with '{agent_name}' (Testing Memory)", Colors.GREEN)
 
     observer2 = MemLearnObserver(verbose=True)
-    session2 = PlaygroundSession(agent_name, observer2)
+    session2 = PlaygroundSession(agent_name, observer2, model_string=MODEL_NAME)
     session2.start()
 
     try:
@@ -645,11 +855,13 @@ start a NEW session with the SAME agent to see if it remembers.{Colors.RESET}
 
 def interactive_menu():
     """Main interactive menu."""
+    global MODEL_NAME
     observer = MemLearnObserver(verbose=True)
     current_session = None
 
     while True:
         print_header("MemLearn Playground", Colors.CYAN)
+        print(f"  {Colors.GRAY}Model: {MODEL_NAME}{Colors.RESET}")
 
         # Show existing agents
         agents = list_existing_agents()
@@ -663,6 +875,7 @@ def interactive_menu():
   {Colors.CYAN}new <name>{Colors.RESET}     - Create and start a new agent
   {Colors.CYAN}start <name>{Colors.RESET}   - Start session with existing agent  
   {Colors.CYAN}start <#>{Colors.RESET}      - Start session with agent by number
+  {Colors.CYAN}model <model>{Colors.RESET}  - Switch model (e.g. anthropic:claude-sonnet-4-20250514)
   {Colors.CYAN}demo{Colors.RESET}           - Run the automated persistence demo
   {Colors.CYAN}stats{Colors.RESET}          - Show current session statistics
   {Colors.CYAN}inspect{Colors.RESET}        - Inspect current agent's memory
@@ -703,7 +916,7 @@ def interactive_menu():
                 current_session.end()
 
             observer = MemLearnObserver(verbose=True)
-            current_session = PlaygroundSession(arg, observer)
+            current_session = PlaygroundSession(arg, observer, model_string=MODEL_NAME)
             current_session.start()
 
             # Enter chat mode
@@ -729,12 +942,37 @@ def interactive_menu():
                 current_session.end()
 
             observer = MemLearnObserver(verbose=True)
-            current_session = PlaygroundSession(agent_name, observer)
+            current_session = PlaygroundSession(
+                agent_name, observer, model_string=MODEL_NAME
+            )
             current_session.start()
 
             # Enter chat mode
             run_chat_mode(current_session, observer)
             current_session = None
+
+        elif action == "model":
+            if not arg:
+                print(f"Current model: {Colors.CYAN}{MODEL_NAME}{Colors.RESET}")
+                print(f"\n{Colors.WHITE}Available model formats:{Colors.RESET}")
+                print(f"  {Colors.GRAY}openai:gpt-5.2{Colors.RESET}")
+                print(f"  {Colors.GRAY}openai:gpt-4.1{Colors.RESET}")
+                print(
+                    f"  {Colors.GRAY}anthropic:claude-sonnet-4-20250514{Colors.RESET}"
+                )
+                print(
+                    f"  {Colors.GRAY}anthropic:claude-3-5-sonnet-latest{Colors.RESET}"
+                )
+                print(f"  {Colors.GRAY}google_genai:gemini-2.5-pro{Colors.RESET}")
+                print(f"  {Colors.GRAY}google_genai:gemini-2.0-flash{Colors.RESET}")
+                continue
+
+            # Check API key for the new model
+            if not check_api_keys(arg):
+                continue
+
+            MODEL_NAME = arg
+            print_success(f"Model switched to: {MODEL_NAME}")
 
         elif action == "stats":
             observer.display_stats()
@@ -752,19 +990,36 @@ def interactive_menu():
 
 def run_chat_mode(session: PlaygroundSession, observer: MemLearnObserver):
     """Run interactive chat mode with an agent."""
+    multiline_mode = False
+    prompt_session = create_multiline_prompt_session()
+
+    def print_mode_hint():
+        if multiline_mode:
+            print(
+                f"{Colors.DIM}Multi-line mode: Enter for new line, Escape+Enter or Ctrl+D to send{Colors.RESET}"
+            )
+        else:
+            print(f"{Colors.DIM}Single-line mode: Enter to send{Colors.RESET}")
+
     print(
         f"""
 {Colors.DIM}{'─' * 60}
 Chat mode with {session.agent_name}
-Commands: /stats /inspect /memory /end /help
+Commands: /stats /inspect /memory /multiline /end /help
 {'─' * 60}{Colors.RESET}
 """
     )
+    print_mode_hint()
 
     try:
         while True:
             try:
-                user_input = input(f"\n{Colors.GREEN}You:{Colors.RESET} ").strip()
+                if multiline_mode:
+                    user_input = prompt_session.prompt(
+                        f"\n{Colors.GREEN}You:{Colors.RESET} "
+                    ).strip()
+                else:
+                    user_input = input(f"\n{Colors.GREEN}You:{Colors.RESET} ").strip()
             except (EOFError, KeyboardInterrupt):
                 break
 
@@ -781,15 +1036,19 @@ Commands: /stats /inspect /memory /end /help
                     observer.display_stats()
                 elif cmd == "inspect" or cmd == "memory":
                     inspect_memory(session)
+                elif cmd == "multiline":
+                    multiline_mode = not multiline_mode
+                    print_mode_hint()
                 elif cmd == "help":
                     print(
                         f"""
 {Colors.CYAN}Available commands:{Colors.RESET}
-  /stats    - Show session statistics
-  /inspect  - Inspect memory filesystem
-  /memory   - Alias for /inspect
-  /end      - End this session
-  /help     - Show this help
+  /stats     - Show session statistics
+  /inspect   - Inspect memory filesystem
+  /memory    - Alias for /inspect
+  /multiline - Toggle multi-line input mode
+  /end       - End this session
+  /help      - Show this help
 """
                     )
                 else:
@@ -826,13 +1085,54 @@ def inspect_memory(session: PlaygroundSession):
                 print(f"    {Colors.DIM}... and {len(entries) - 5} more{Colors.RESET}")
 
 
+def check_api_keys(model_string: str) -> bool:
+    """Check if the required API key is set for the given model provider."""
+    provider = model_string.split(":")[0].lower() if ":" in model_string else "openai"
+
+    key_mapping = {
+        "openai": ("OPENAI_API_KEY", "OpenAI"),
+        "anthropic": ("ANTHROPIC_API_KEY", "Anthropic"),
+        "google_genai": ("GOOGLE_API_KEY", "Google (Gemini)"),
+        "google": ("GOOGLE_API_KEY", "Google (Gemini)"),
+        "bedrock": ("AWS_ACCESS_KEY_ID", "AWS Bedrock"),
+        "azure_openai": ("AZURE_OPENAI_API_KEY", "Azure OpenAI"),
+    }
+
+    if provider in key_mapping:
+        env_var, provider_name = key_mapping[provider]
+        if not os.getenv(env_var):
+            print_warning(f"{env_var} not set for {provider_name} models.")
+            print(
+                f"  Set it in your .env file or environment to use {provider_name} models."
+            )
+            return False
+    return True
+
+
 def main():
     """Main entry point."""
-    # Check for API key
-    if not os.getenv("OPENAI_API_KEY"):
-        print_error("OPENAI_API_KEY environment variable not set.")
-        print("Please set your OpenAI API key in a .env file or environment.")
+    # Check for at least one API key
+    has_any_key = any(
+        [
+            os.getenv("OPENAI_API_KEY"),
+            os.getenv("ANTHROPIC_API_KEY"),
+            os.getenv("GOOGLE_API_KEY"),
+        ]
+    )
+
+    if not has_any_key:
+        print_error("No API keys found.")
+        print("Please set at least one of the following in your .env file:")
+        print("  - OPENAI_API_KEY (for OpenAI models like gpt-5.2)")
+        print("  - ANTHROPIC_API_KEY (for Anthropic models like claude-sonnet-4)")
+        print("  - GOOGLE_API_KEY (for Google models like gemini-2.5-pro)")
         sys.exit(1)
+
+    # Check if the default model's API key is available
+    if not check_api_keys(MODEL_NAME):
+        print_warning(
+            f"Default model '{MODEL_NAME}' may not work without the required API key."
+        )
 
     # Ensure memlearn home exists
     MEMLEARN_HOME.mkdir(parents=True, exist_ok=True)
@@ -845,6 +1145,10 @@ def main():
             return
         elif sys.argv[1] == "--help":
             print(__doc__)
+            print(f"\nCurrent model: {MODEL_NAME}")
+            print("Set MEMLEARN_MODEL env var to change, e.g.:")
+            print("  export MEMLEARN_MODEL='anthropic:claude-sonnet-4-20250514'")
+            print("  export MEMLEARN_MODEL='google_genai:gemini-2.5-pro'")
             return
 
     # Run interactive menu

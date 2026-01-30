@@ -1,0 +1,19 @@
+[project]
+name = "evals"
+version = "0.1.0"
+description = "Evaluation & benchmarking for MemLearn"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain>=0.3.0",
+    "langchain-openai>=1.1.7",
+    "memlearn>=0.0.1",
+    "python-dotenv>=1.0.0",
+]
+
+
+[tool.uv.sources]
+memlearn = { workspace = true }
+
+[tool.uv]
+prerelease = "allow"

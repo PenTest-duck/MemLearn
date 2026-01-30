@@ -1,0 +1,8 @@
+# Logs and results from evaluation runs
+logs/
+results/
+locomo/logs/
+
+# Python cache
+__pycache__/
+*.pyc

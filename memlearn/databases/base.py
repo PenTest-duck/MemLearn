@@ -55,6 +55,11 @@ class BaseDatabase(ABC):
         pass
 
     @abstractmethod
+    def update_agent(self, agent: Agent) -> None:
+        """Update an existing agent."""
+        pass
+
+    @abstractmethod
     def delete_agent(self, agent_id: str) -> bool:
         """Delete an agent. Returns True if deleted."""
         pass

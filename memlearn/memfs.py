@@ -11,6 +11,7 @@ import datetime
 import hashlib
 import json
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -47,12 +48,17 @@ from memlearn.types import (
 )
 from memlearn.vector_stores.base import BaseVectorStore
 from memlearn.vector_stores.chroma_vdb import ChromaVectorStore
+from memlearn.embedders.conversation_chunker import (
+    chunk_conversation_history,
+    create_chunk_for_embedding,
+)
+from memlearn.prompts import get_memory_note_prompts
 
 # Folders to sync between persistent and ephemeral storage
 PERSISTENT_FOLDERS = ["memory", "raw", "mnt"]
 
-# Conversation history file path
-CONVERSATION_HISTORY_PATH = "/raw/conversation-history/CURRENT.json"
+# Conversation history file path (markdown format for agent-friendly access)
+CONVERSATION_HISTORY_PATH = "/raw/conversation-history/CURRENT.md"
 
 # Default AGENTS.md content that explains how to use MemFS
 AGENTS_MD_CONTENT = """# MemFS Agent Guide
@@ -83,6 +89,7 @@ Welcome to MemFS - your filesystem-based memory system.
 - **list**: List directory contents with metadata
 - **move**: Move/rename files or folders
 - **search**: Semantic + keyword hybrid search
+- **find**: Find files by name pattern (glob, regex, or exact match)
 - **peek**: View file/folder metadata without reading full content
 
 ## Best Practices
@@ -112,6 +119,7 @@ class MemFS:
         vector_store: BaseVectorStore | None = None,
         reranker: BaseReranker | None = None,
         llm: BaseLLM | None = None,
+        read_only: bool = False,
     ):
         """
         Initialize MemFS.
@@ -124,8 +132,16 @@ class MemFS:
             vector_store: Custom vector store implementation.
             reranker: Custom reranker implementation.
             llm: Custom LLM implementation for summarization and reflection.
+            read_only: If True, the MemFS instance operates in read-only mode.
+                This disables:
+                - Summarization on spindown
+                - Conversation history storage
+                - Memory note updates on spindown
+                - Write operations via tool providers (create, edit, delete, mkdir, move)
+                - Persistent state sync on spindown
         """
         self.config = config or MemLearnConfig.from_env()
+        self.read_only = read_only
 
         # Initialize components
         self.sandbox = sandbox or self._create_sandbox()
@@ -137,6 +153,12 @@ class MemFS:
 
         self._initialized = False
         self._version_counter = 0
+        self._session_branch_name: str | None = None
+
+    def _debug_log(self, message: str) -> None:
+        """Log a debug message if debug mode is enabled."""
+        if self.config.debug:
+            print(f"[MemLearn DEBUG] {message}")
 
     def _create_sandbox(self) -> BaseSandbox:
         """Create sandbox based on config."""
@@ -175,11 +197,21 @@ class MemFS:
 
     def _create_llm(self) -> BaseLLM | None:
         """Create LLM based on config."""
-        # Only create LLM if summarization is enabled
-        if not self.config.llm.summarize_on_spindown:
+        # Only create LLM if summarization OR memory note update is enabled
+        needs_llm = (
+            self.config.llm.summarize_on_spindown
+            or self.config.llm.update_memory_note_on_spindown
+        )
+        if not needs_llm:
+            self._debug_log(
+                "_create_llm() returning None: neither summarization nor memory note update enabled"
+            )
             return None
 
         if self.config.llm.provider == "openai":
+            self._debug_log(
+                f"_create_llm() creating OpenAILLM with model={self.config.llm.model}"
+            )
             return OpenAILLM(
                 api_key=self.config.llm.api_key,
                 model=self.config.llm.model,
@@ -187,6 +219,9 @@ class MemFS:
             )
 
         # Future: Add anthropic, gemini providers
+        self._debug_log(
+            f"_create_llm() returning None: unsupported provider {self.config.llm.provider}"
+        )
         return None
 
     def initialize(self) -> None:
@@ -201,6 +236,11 @@ class MemFS:
 
         # Create default folder structure
         self._create_default_structure()
+
+        # Initialize git version control and commit initial state
+        self._git_init()
+        self._git_commit_all("init")
+
         self._initialized = True
 
     def _create_default_structure(self) -> None:
@@ -360,45 +400,97 @@ class MemFS:
         # Initialize conversation history for this session
         self._init_conversation_history()
 
+        # Initialize git version control, commit initial state, and create session branch
+        self._git_init()
+        self._git_commit_all("init")
+        self._git_create_session_branch()
+
         self._initialized = True
 
     def spindown(self, status: SessionStatus = SessionStatus.COMPLETED) -> None:
         """
         End session and persist state.
 
-        This will:
+        This will (unless in read_only mode):
         1. Summarize conversation history using LLM (if enabled)
         2. Archive conversation history (rename CURRENT to timestamp)
-        3. Sync sandbox to persistent storage
-        4. Update session record
-        5. Clean up ephemeral sandbox
+        3. Generate/update memory note for next session (if enabled)
+        4. Sync sandbox to persistent storage
+        5. Update session record
+        6. Clean up ephemeral sandbox
+
+        In read_only mode, only cleanup is performed - no state modifications.
 
         Args:
             status: Final session status (completed or aborted)
         """
+        self._debug_log(
+            f"spindown() called with status={status}, read_only={self.read_only}"
+        )
         if not self._initialized:
+            self._debug_log("spindown() skipped: not initialized")
             return
 
-        # Generate conversation summary using LLM (if enabled and conversation exists)
-        conversation_summary = None
-        if self.config.llm.summarize_on_spindown and self.llm is not None:
-            conversation_summary = self._summarize_conversation()
+        self._debug_log(
+            f"agent_id={self.config.agent_id}, session_id={self.config.session_id}"
+        )
 
-        # Archive conversation history (with summary in metadata)
-        self._archive_conversation_history(summary=conversation_summary)
+        # In read-only mode, skip all write operations
+        if not self.read_only:
+            # Generate conversation summary using LLM (if enabled and conversation exists)
+            conversation_summary = None
+            if self.config.llm.summarize_on_spindown and self.llm is not None:
+                self._debug_log("Generating conversation summary...")
+                conversation_summary = self._summarize_conversation()
+                self._debug_log(
+                    f"Conversation summary generated: {conversation_summary is not None}"
+                )
 
-        # Sync to persistent storage (excluding /tmp)
-        if self.config.agent_id:
-            persistent_path = self.config.sandbox.get_agent_persistent_path(
-                self.config.agent_id
+            # Archive conversation history (with summary in metadata)
+            self._debug_log("Archiving conversation history...")
+            self._archive_conversation_history(summary=conversation_summary)
+
+            # Generate/update memory note for next session
+            self._debug_log(
+                f"Memory note update check: update_memory_note_on_spindown={self.config.llm.update_memory_note_on_spindown}, llm={self.llm is not None}"
             )
-            self.sandbox.sync_to_persistent(str(persistent_path), PERSISTENT_FOLDERS)
+            if self.config.llm.update_memory_note_on_spindown and self.llm is not None:
+                self._debug_log("Generating memory note...")
+                new_note = self._generate_memory_note()
+                self._debug_log(
+                    f"Memory note generated: {new_note is not None}, content length: {len(new_note) if new_note else 0}"
+                )
+                if new_note:
+                    self._debug_log(
+                        f"New memory note preview: {new_note[:200]}..."
+                        if len(new_note) > 200
+                        else f"New memory note: {new_note}"
+                    )
+                    self._update_memory_note(new_note)
+                else:
+                    self._debug_log(
+                        "Memory note generation returned None - note will NOT be updated"
+                    )
 
-        # End session in database
-        if self.config.session_id:
-            self.database.end_session(self.config.session_id, status)
+            # Commit session end with summary (git version control)
+            self._git_session_end_commit(summary=conversation_summary)
 
-        # Clean up
+            # Sync to persistent storage (excluding /tmp)
+            if self.config.agent_id:
+                persistent_path = self.config.sandbox.get_agent_persistent_path(
+                    self.config.agent_id
+                )
+                self.sandbox.sync_to_persistent(
+                    str(persistent_path), PERSISTENT_FOLDERS
+                )
+
+            # End session in database
+            if self.config.session_id:
+                self.database.end_session(self.config.session_id, status)
+        else:
+            self._debug_log("Read-only mode: skipping all write operations on spindown")
+
+        # Clean up (always performed)
         self.vector_store.close()
         self.database.close()
         self.sandbox.cleanup()
@@ -409,11 +501,182 @@ class MemFS:
         self.config.agent_name = None
         self._initialized = False
 
+    def get_memory_note(self) -> str:
+        """
+        Get the current memory note for this agent.
+
+        The memory note is a concise summary of what's stored in the agent's
+        persistent memory. It's designed to be injected into the agent's
+        system prompt to provide immediate context about available knowledge.
+
+        Returns:
+            The memory note string, or a default message if not available.
+
+        Example:
+            ```python
+            from memlearn import MemFS
+            from memlearn.prompts import get_memfs_system_prompt_with_note
+
+            with MemFS.for_agent("my-agent") as memfs:
+                memory_note = memfs.get_memory_note()
+                system_prompt = f'''You are a helpful assistant.
+
+                {get_memfs_system_prompt_with_note(memory_note)}
+                '''
+                # Use system_prompt with your LLM...
+            ```
+        """
+        if not self.config.agent_id:
+            return "This memory is empty. No files or insights have been stored yet."
+
+        agent = self.database.get_agent_by_id(self.config.agent_id)
+        if agent is None:
+            return "This memory is empty. No files or insights have been stored yet."
+
+        return agent.memory_note
+
+    def _generate_memory_note(self) -> str | None:
+        """
+        Generate an updated memory note using the LLM.
+
+        This method:
+        1. Gets the current memory note
+        2. Lists the entire filesystem structure
+        3. Uses the LLM to generate a concise, updated note
+
+        Returns:
+            The new memory note, or None if generation failed or was skipped.
+        """
+        self._debug_log("_generate_memory_note() called")
+        if self.llm is None:
+            self._debug_log("_generate_memory_note() returning None: llm is None")
+            return None
+
+        if not self.config.agent_id:
+            self._debug_log("_generate_memory_note() returning None: agent_id is None")
+            return None
+
+        # Get current agent and memory note
+        agent = self.database.get_agent_by_id(self.config.agent_id)
+        if agent is None:
+            self._debug_log(
+                "_generate_memory_note() returning None: agent not found in database"
+            )
+            return None
+
+        current_note = agent.memory_note
+        self._debug_log(
+            f"Current memory note: {current_note[:100]}..."
+            if len(current_note) > 100
+            else f"Current memory note: {current_note}"
+        )
+
+        # Generate filesystem listing
+        fs_listing = self._generate_fs_listing_for_note()
+        self._debug_log(
+            f"Filesystem listing ({len(fs_listing)} chars):\n{fs_listing[:500]}..."
+            if len(fs_listing) > 500
+            else f"Filesystem listing:\n{fs_listing}"
+        )
+
+        # Get prompts
+        max_tokens = self.config.llm.memory_note_max_tokens
+        system_prompt, user_prompt = get_memory_note_prompts(
+            current_note=current_note,
+            fs_listing=fs_listing,
+        )
+        self._debug_log(f"Calling LLM with max_tokens={max_tokens}")
+
+        try:
+            response = self.llm.complete(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                temperature=0.3,
+                max_tokens=max_tokens,
+            )
+            self._debug_log(
+                f"LLM response received, content length: {len(response.content)}"
+            )
+
+            return response.content.strip()
+
+        except Exception as e:
+            self._debug_log(
+                f"_generate_memory_note() exception: {type(e).__name__}: {e}"
+            )
+            # Don't fail spindown if note generation fails
+            return None
+
+    def _generate_fs_listing_for_note(self) -> str:
+        """Generate a filesystem listing formatted for memory note generation."""
+        lines = []
+
+        def list_recursive(path: str, depth: int = 0) -> None:
+            try:
+                items = self.sandbox.list_directory(path)
+            except Exception:
+                return
+
+            for item in sorted(items):
+                # Always exclude .git directory (internal version control)
+                if item == ".git":
+                    continue
+                item_path = f"{path}/{item}" if path != "/" else f"/{item}"
+                is_dir = self.sandbox.is_dir(item_path)
+                indent = "  " * depth
+
+                # Get metadata for description
+                meta = self.database.get_metadata(item_path)
+                desc = ""
+                if meta and meta.description:
+                    desc = f" - {meta.description[:60]}{'...' if len(meta.description) > 60 else ''}"
+
+                if is_dir:
+                    lines.append(f"{indent}📁 {item}/{desc}")
+                    # Recurse into directories (limit depth to avoid huge outputs)
+                    if depth < 3:
+                        list_recursive(item_path, depth + 1)
+                else:
+                    size = self.sandbox.get_size(item_path)
+                    size_str = self._format_size(size)
+                    lines.append(f"{indent}📄 {item} ({size_str}){desc}")
+
+        list_recursive("/")
+
+        if not lines:
+            return "(Empty filesystem)"
+
+        return "\n".join(lines)
+
+    def _update_memory_note(self, new_note: str) -> None:
+        """Update the agent's memory note in the database."""
+        self._debug_log(
+            f"_update_memory_note() called with note length: {len(new_note)}"
+        )
+        if not self.config.agent_id:
+            self._debug_log("_update_memory_note() returning: agent_id is None")
+            return
+
+        agent = self.database.get_agent_by_id(self.config.agent_id)
+        if agent is None:
+            self._debug_log(
+                "_update_memory_note() returning: agent not found in database"
+            )
+            return
+
+        self._debug_log(
+            f"Updating agent {agent.name} (id={agent.agent_id}) memory_note"
+        )
+        agent.memory_note = new_note
+        self.database.update_agent(agent)
+        self._debug_log("Memory note updated successfully in database")
+
     @classmethod
     def for_agent(
         cls,
         agent_name: str,
         config: MemLearnConfig | None = None,
+        read_only: bool = False,
     ) -> "MemFS":
         """
         Create a MemFS instance for an agent and start a new session.
@@ -424,6 +687,11 @@ class MemFS:
         Args:
             agent_name: Unique name for the agent (e.g., "code-editor")
             config: Optional configuration. Uses default_persistent() if not provided.
+            read_only: If True, creates a read-only MemFS instance that:
+                - Does not modify the underlying filesystem on spindown
+                - Does not store conversation history
+                - Only provides read-only tools (read, list, search, peek, find)
+                - Bash tool (if enabled) instructs LLM not to modify files
 
         Returns:
             Initialized MemFS instance ready for use.
@@ -435,6 +703,11 @@ class MemFS:
                 tools = OpenAIToolProvider(memfs)
                 # ... run agent session ...
             # Automatically persists and cleans up
+
+            # Read-only mode for retrieval
+            with MemFS.for_agent("code-editor", read_only=True) as memfs:
+                tools = memfs.get_tool_provider()  # Returns read-only tools
+                # ... query agent memory without modifications ...
 
             # Manual lifecycle
             memfs = MemFS.for_agent("code-editor")
@@ -448,9 +721,58 @@ class MemFS:
         if config is None:
             config = MemLearnConfig.default_persistent()
 
-        memfs = cls(config=config)
+        memfs = cls(config=config, read_only=read_only)
         memfs.spinup(agent_name)
         return memfs
+
+    def get_tool_provider(
+        self,
+        provider: str = "langchain",
+        tool_prefix: str = "memfs",
+        enable_bash: bool = False,
+    ):
+        """
+        Get a tool provider configured appropriately for this MemFS instance.
+
+        The returned provider automatically respects the read_only mode:
+        - In read-only mode: only read/search tools are provided (read, list, search, peek, find)
+        - In read-write mode: all tools are provided
+
+        Args:
+            provider: The tool provider type. Currently supports "langchain".
+            tool_prefix: Prefix for tool names (e.g., "memfs_read").
+            enable_bash: Whether to enable the bash tool.
+                In read-only mode, bash tool description instructs LLM not to modify files.
+
+        Returns:
+            A configured tool provider instance.
+
+        Example:
+            ```python
+            # Read-write mode
+            with MemFS.for_agent("my-agent") as memfs:
+                provider = memfs.get_tool_provider(enable_bash=True)
+                tools = provider.get_tools()
+
+            # Read-only mode (for retrieval/queries)
+            with MemFS.for_agent("my-agent", read_only=True) as memfs:
+                provider = memfs.get_tool_provider()  # Only read tools
+                tools = provider.get_tools()
+            ```
+        """
+        if provider == "langchain":
+            from memlearn.tools.langchain_tools import LangChainToolProvider
+
+            return LangChainToolProvider(
+                memfs=self,
+                tool_prefix=tool_prefix,
+                enable_bash=enable_bash,
+                read_only=self.read_only,
+            )
+        else:
+            raise ValueError(
+                f"Unknown tool provider: {provider}. Supported: 'langchain'"
+            )
 
     # =========================================================================
     # Conversation History Methods
@@ -503,7 +825,7 @@ class MemFS:
             return None
 
     def _init_conversation_history(self) -> None:
-        """Create CURRENT.json with session metadata. Called during spinup."""
+        """Create CURRENT.md with session metadata. Called during spinup."""
         if not self.config.session_id or not self.config.agent_id:
             return
 
@@ -513,9 +835,9 @@ class MemFS:
             agent_name=self.config.agent_name or "unknown",
         )
 
-        # Write to file (bypass permissions since this is system operation)
-        content = json.dumps(history.to_dict(), indent=2)
-        self.sandbox.write_file("raw/conversation-history/CURRENT.json", content)
+        # Write to file in markdown format (bypass permissions since this is system operation)
+        content = history.to_markdown()
+        self.sandbox.write_file("raw/conversation-history/CURRENT.md", content)
 
         # Create metadata for the file
         metadata = NodeMetadata(
@@ -523,7 +845,7 @@ class MemFS:
             node_type=NodeType.FILE,
             permissions=Permissions(readable=True, writable=False, executable=False),
             owner="system",
-            file_type=FileType.JSON,
+            file_type=FileType.MARKDOWN,
             description=f"Conversation history for session {self.config.session_id}",
             size_bytes=len(content.encode()),
             line_count=content.count("\n") + 1,
@@ -533,12 +855,18 @@ class MemFS:
 
     def _archive_conversation_history(self, summary: str | None = None) -> None:
         """
-        Archive CURRENT.json with optional LLM-generated summary.
+        Archive CURRENT.md with optional LLM-generated summary.
+
+        This method:
+        1. Appends the summary to the conversation file (if provided)
+        2. Renames CURRENT.md to a timestamped filename
+        3. Updates metadata with the summary
+        4. Embeds the conversation history for semantic search (if auto_embed enabled)
 
         Args:
             summary: Optional conversation summary to store in metadata.
         """
-        current_path = "raw/conversation-history/CURRENT.json"
+        current_path = "raw/conversation-history/CURRENT.md"
 
         if not self.sandbox.exists(current_path):
             return
@@ -546,20 +874,20 @@ class MemFS:
         # Read the history to get the start time
         try:
             content = self.sandbox.read_file(current_path)
-            history_data = json.loads(content)
-            started_at = history_data.get("started_at", time.time())
+            history = ConversationHistory.from_markdown(content)
+            started_at = history.started_at
 
-            # Add summary to the history data if provided
+            # Add summary to the history if provided (as a final section)
             if summary:
-                history_data["summary"] = summary
-                # Update the file with the summary included
-                content = json.dumps(history_data, indent=2)
+                # Append summary section to the markdown
+                summary_section = f"\n---\n\n" f"## Session Summary\n\n" f"{summary}\n"
+                content = content + summary_section
                 self.sandbox.write_file(current_path, content)
 
             # Create timestamp filename (ISO format with safe characters)
             dt = datetime.datetime.fromtimestamp(started_at)
             timestamp_str = dt.strftime("%Y-%m-%dT%H-%M-%S")
-            archive_filename = f"{timestamp_str}.json"
+            archive_filename = f"{timestamp_str}.md"
             archive_path = f"raw/conversation-history/{archive_filename}"
 
             # Rename the file
@@ -580,6 +908,12 @@ class MemFS:
                     old_metadata.extra["summary_model"] = (
                         self.llm.model if self.llm else None
                     )
+
+                # Embed the conversation history for semantic search
+                if self.config.auto_embed:
+                    archive_content = self.sandbox.read_file(archive_path)
+                    self._embed_file(old_metadata, archive_content)
+
                 self.database.save_metadata(old_metadata)
 
         except Exception:
@@ -591,22 +925,35 @@ class MemFS:
         Append a message to the current session's conversation history.
 
         Call this after each LLM interaction to keep the history updated.
+        In read-only mode, this is a no-op.
 
         Args:
-            message: A message dict with role and content
-                (e.g., {"role": "user", "content": "..."})
+            message: A message dict with role, content, and optional fields:
+                - role: "user", "assistant", "system", "tool_call", "tool_result"
+                - content: The message content
+                - timestamp: Optional Unix timestamp (added automatically if missing)
+                - tool_name: Optional tool name for tool_call/tool_result roles
         """
-        current_path = "raw/conversation-history/CURRENT.json"
+        # No-op in read-only mode
+        if self.read_only:
+            return
+
+        current_path = "raw/conversation-history/CURRENT.md"
 
         if not self.sandbox.exists(current_path):
             return
 
         try:
             content = self.sandbox.read_file(current_path)
-            history = ConversationHistory.from_dict(json.loads(content))
+            history = ConversationHistory.from_markdown(content)
+
+            # Add timestamp if not present
+            if "timestamp" not in message:
+                message = {**message, "timestamp": time.time()}
+
             history.append_message(message)
 
-            new_content = json.dumps(history.to_dict(), indent=2)
+            new_content = history.to_markdown()
             self.sandbox.write_file(current_path, new_content)
 
             # Update metadata size
@@ -627,14 +974,14 @@ class MemFS:
         Returns:
             List of message dicts from the conversation.
         """
-        current_path = "raw/conversation-history/CURRENT.json"
+        current_path = "raw/conversation-history/CURRENT.md"
 
         if not self.sandbox.exists(current_path):
             return []
 
         try:
             content = self.sandbox.read_file(current_path)
-            history = ConversationHistory.from_dict(json.loads(content))
+            history = ConversationHistory.from_markdown(content)
             return history.messages
         except Exception:
             return []
@@ -655,7 +1002,7 @@ class MemFS:
         Returns:
             ToolResult with compacted messages for the context window
         """
-        current_path = "raw/conversation-history/CURRENT.json"
+        current_path = "raw/conversation-history/CURRENT.md"
 
         if not self.sandbox.exists(current_path):
             return ToolResult(
@@ -665,7 +1012,7 @@ class MemFS:
 
         try:
             content = self.sandbox.read_file(current_path)
-            history = ConversationHistory.from_dict(json.loads(content))
+            history = ConversationHistory.from_markdown(content)
 
             if len(history.messages) <= preserve_last_n:
                 return ToolResult(
@@ -678,7 +1025,7 @@ class MemFS:
             history.add_compaction_marker(summary)
 
             # Save updated history with marker
-            new_content = json.dumps(history.to_dict(), indent=2)
+            new_content = history.to_markdown()
             self.sandbox.write_file(current_path, new_content)
 
             # Build compacted messages for return
@@ -1086,6 +1433,9 @@ class MemFS:
             self._log_operation("create_file", path, {"size": metadata.size_bytes})
             self._create_version_snapshot(f"Created file: {path}", [path])
 
+            # Git commit
+            self._git_commit_all(f"create: {path}")
+
             return ToolResult(
                 status="success",
                 message=f"Created file: {path}",
@@ -1187,6 +1537,9 @@ class MemFS:
             )
             self._create_version_snapshot(f"Edited file: {path}", [path])
 
+            # Git commit
+            self._git_commit_all(f"edit: {path}")
+
             return ToolResult(
                 status="success",
                 message=f"Successfully edited {path}",
@@ -1256,6 +1609,9 @@ class MemFS:
             # Log and version
             self._log_operation("delete", path, {"recursive": recursive})
             self._create_version_snapshot(f"Deleted: {path}", [path])
+
+            # Git commit
+            self._git_commit_all(f"delete: {path}")
 
             return ToolResult(
                 status="success",
@@ -1343,6 +1699,9 @@ class MemFS:
             # Log and version
             self._log_operation("create_directory", path)
             self._create_version_snapshot(f"Created directory: {path}", [path])
+
+            # Git commit
+            self._git_commit_all(f"mkdir: {path}")
 
             return ToolResult(
                 status="success",
@@ -1441,6 +1800,9 @@ class MemFS:
             return entries
 
         for item in items:
+            # Always exclude .git directory (internal version control)
+            if item == ".git":
+                continue
             if not show_hidden and item.startswith("."):
                 continue
 
@@ -1526,6 +1888,9 @@ class MemFS:
             # Log and version
             self._log_operation("move", src, {"destination": dst})
             self._create_version_snapshot(f"Moved {src} to {dst}", [src, dst])
+
+            # Git commit
+            self._git_commit_all(f"move: {src} -> {dst}")
 
             return ToolResult(
                 status="success",
@@ -1728,6 +2093,9 @@ class MemFS:
             try:
                 items = self.sandbox.list_directory(dir_path)
                 for item in items:
+                    # Always exclude .git directory (internal version control)
+                    if item == ".git":
+                        continue
                     item_path = f"{dir_path}/{item}" if dir_path != "/" else f"/{item}"
                     if self.sandbox.is_dir(item_path):
                         search_recursive(item_path)
@@ -1780,6 +2148,422 @@ class MemFS:
     # =========================================================================
     # Peek Operation
     # =========================================================================
+
+    def find(
+        self,
+        pattern: str,
+        path: str = "/",
+        match_type: str = "glob",
+        include_dirs: bool = False,
+        max_results: int = 50,
+        offset: int = 0,
+        sort_by: str = "path",
+        sort_order: str = "asc",
+    ) -> ToolResult:
+        """
+        Find files by name pattern with LLM-friendly pagination and metadata.
+
+        This tool finds files matching a name pattern and returns metadata in a
+        format optimized for LLM context windows. It supports pagination to avoid
+        overwhelming the context with too many results.
+
+        Args:
+            pattern: The pattern to match against file names.
+                - For glob: supports *, ?, ** (e.g., "*.md", "test_*.py", "**/*.json")
+                - For regex: full regex pattern (e.g., ".*\\.md$", "test_\\d+\\.py")
+                - For exact: exact filename match (e.g., "README.md")
+            path: Base path to search from. Defaults to "/" (entire MemFS).
+            match_type: Pattern matching type - "glob", "regex", or "exact".
+            include_dirs: If True, also include matching directories.
+            max_results: Maximum number of results to return (for pagination).
+                Default is 50. Set to -1 for unlimited (use with caution).
+            offset: Number of results to skip (for pagination). Default is 0.
+            sort_by: Sort results by "path", "name", "size", "modified", or "created".
+            sort_order: Sort order - "asc" (ascending) or "desc" (descending).
+
+        Returns:
+            ToolResult with:
+            - matches: List of matching files with metadata
+            - total_count: Total number of matches (before pagination)
+            - returned_count: Number of results returned in this response
+            - has_more: Whether there are more results after this page
+            - next_offset: Offset to use to get the next page
+            - formatted: Human-readable summary of results
+        """
+        path = self._normalize_path(path)
+
+        if not self.sandbox.exists(path):
+            return ToolResult(
+                status="error",
+                message=f"Path not found: {path}",
+            )
+
+        if not self.sandbox.is_dir(path):
+            return ToolResult(
+                status="error",
+                message=f"Path is not a directory: {path}. Use a directory path to search.",
+            )
+
+        try:
+            # Compile pattern based on match type
+            if match_type == "regex":
+                try:
+                    compiled_pattern = re.compile(pattern)
+                except re.error as e:
+                    return ToolResult(
+                        status="error",
+                        message=f"Invalid regex pattern: {e}",
+                    )
+            elif match_type == "glob":
+                # Convert glob to regex
+                regex_pattern = self._glob_to_regex(pattern)
+                compiled_pattern = re.compile(regex_pattern)
+            else:  # exact
+                compiled_pattern = None  # Use direct comparison
+
+            # Collect all matching files
+            all_matches = self._find_files_recursive(
+                path, pattern, compiled_pattern, match_type, include_dirs
+            )
+
+            total_count = len(all_matches)
+
+            # Sort results
+            all_matches = self._sort_find_results(all_matches, sort_by, sort_order)
+
+            # Apply pagination
+            if max_results == -1:
+                paginated_matches = all_matches[offset:]
+            else:
+                paginated_matches = all_matches[offset : offset + max_results]
+
+            returned_count = len(paginated_matches)
+            has_more = offset + returned_count < total_count
+            next_offset = offset + returned_count if has_more else None
+
+            # Format results with metadata
+            results = []
+            for match in paginated_matches:
+                file_path = match["path"]
+                metadata = self.database.get_metadata(file_path)
+
+                result_entry = {
+                    "path": file_path,
+                    "name": match["name"],
+                    "type": "folder" if match["is_dir"] else "file",
+                    "size_bytes": match.get("size", 0),
+                    "size_human": self._format_size(match.get("size", 0)),
+                }
+
+                if metadata:
+                    result_entry.update(
+                        {
+                            "description": metadata.description or None,
+                            "tags": metadata.tags if metadata.tags else None,
+                            "file_type": (
+                                metadata.file_type.value
+                                if not match["is_dir"]
+                                else None
+                            ),
+                            "line_count": (
+                                metadata.line_count if not match["is_dir"] else None
+                            ),
+                            "created": self._format_timestamp(
+                                metadata.timestamps.created_at
+                            ),
+                            "modified": self._format_timestamp(
+                                metadata.timestamps.modified_at
+                            ),
+                            "permissions": f"{'r' if metadata.permissions.readable else '-'}"
+                            f"{'w' if metadata.permissions.writable else '-'}"
+                            f"{'x' if metadata.permissions.executable else '-'}",
+                        }
+                    )
+                else:
+                    result_entry.update(
+                        {
+                            "description": None,
+                            "tags": None,
+                            "file_type": (
+                                self._detect_file_type(file_path, "").value
+                                if not match["is_dir"]
+                                else None
+                            ),
+                            "line_count": None,
+                            "created": None,
+                            "modified": None,
+                            "permissions": None,
+                        }
+                    )
+
+                # Remove None values to keep output clean
+                result_entry = {k: v for k, v in result_entry.items() if v is not None}
+                results.append(result_entry)
+
+            # Build formatted output for LLM readability
+            output_lines = self._format_find_output(
+                pattern,
+                match_type,
+                path,
+                results,
+                total_count,
+                returned_count,
+                offset,
+                has_more,
+                next_offset,
+            )
+
+            # Log operation
+            self._log_operation(
+                "find",
+                path,
+                {
+                    "pattern": pattern,
+                    "match_type": match_type,
+                    "total_matches": total_count,
+                    "returned": returned_count,
+                },
+            )
+
+            return ToolResult(
+                status="success",
+                message=f"Found {total_count} match{'es' if total_count != 1 else ''} for pattern '{pattern}'",
+                data={
+                    "matches": results,
+                    "total_count": total_count,
+                    "returned_count": returned_count,
+                    "offset": offset,
+                    "has_more": has_more,
+                    "next_offset": next_offset,
+                    "pattern": pattern,
+                    "match_type": match_type,
+                    "search_path": path,
+                    "formatted": "\n".join(output_lines),
+                },
+            )
+
+        except Exception as e:
+            return ToolResult(
+                status="error",
+                message=f"Find operation failed: {str(e)}",
+            )
+
+    def _glob_to_regex(self, pattern: str) -> str:
+        """
+        Convert a glob pattern to a regex pattern.
+
+        Supports:
+        - * : matches any characters except /
+        - ** : matches any characters including /
+        - ? : matches any single character except /
+        - [seq] : matches any character in seq
+        - [!seq] : matches any character not in seq
+        """
+        i = 0
+        n = len(pattern)
+        regex_parts = []
+
+        while i < n:
+            c = pattern[i]
+            if c == "*":
+                if i + 1 < n and pattern[i + 1] == "*":
+                    # ** matches anything including path separators
+                    regex_parts.append(".*")
+                    i += 2
+                    # Skip following / if present
+                    if i < n and pattern[i] == "/":
+                        i += 1
+                else:
+                    # * matches anything except /
+                    regex_parts.append("[^/]*")
+                    i += 1
+            elif c == "?":
+                regex_parts.append("[^/]")
+                i += 1
+            elif c == "[":
+                # Find the closing bracket
+                j = i + 1
+                if j < n and pattern[j] == "!":
+                    j += 1
+                if j < n and pattern[j] == "]":
+                    j += 1
+                while j < n and pattern[j] != "]":
+                    j += 1
+                if j >= n:
+                    regex_parts.append("\\[")
+                else:
+                    stuff = pattern[i + 1 : j]
+                    if stuff[0:1] == "!":
+                        stuff = "^" + stuff[1:]
+                    elif stuff[0:1] == "^":
+                        stuff = "\\" + stuff
+                    regex_parts.append(f"[{stuff}]")
+                    j += 1
+                i = j
+            elif c in ".^$+{}|()":
+                regex_parts.append("\\" + c)
+                i += 1
+            else:
+                regex_parts.append(c)
+                i += 1
+
+        return "".join(regex_parts) + "$"
+
+    def _find_files_recursive(
+        self,
+        dir_path: str,
+        pattern: str,
+        compiled_pattern: re.Pattern | None,
+        match_type: str,
+        include_dirs: bool,
+    ) -> list[dict]:
+        """Recursively find files matching the pattern."""
+        matches = []
+
+        try:
+            items = self.sandbox.list_directory(dir_path)
+        except Exception:
+            return matches
+
+        for item in items:
+            # Always exclude .git directory (internal version control)
+            if item == ".git":
+                continue
+            item_path = f"{dir_path}/{item}" if dir_path != "/" else f"/{item}"
+            is_dir = self.sandbox.is_dir(item_path)
+
+            # Check if item matches pattern
+            is_match = False
+            if match_type == "exact":
+                is_match = item == pattern
+            elif compiled_pattern:
+                # For glob/regex, match against just the filename
+                is_match = bool(compiled_pattern.match(item))
+                # Also try matching against full path for ** patterns
+                if not is_match and "**" in pattern:
+                    is_match = bool(compiled_pattern.match(item_path.lstrip("/")))
+
+            # Add to matches if appropriate
+            if is_match and (include_dirs or not is_dir):
+                entry = {
+                    "path": item_path,
+                    "name": item,
+                    "is_dir": is_dir,
+                }
+                if not is_dir:
+                    entry["size"] = self.sandbox.get_size(item_path)
+
+                    # Get modification time from metadata if available
+                    meta = self.database.get_metadata(item_path)
+                    if meta:
+                        entry["modified_at"] = meta.timestamps.modified_at
+                        entry["created_at"] = meta.timestamps.created_at
+                matches.append(entry)
+
+            # Recurse into directories
+            if is_dir:
+                child_matches = self._find_files_recursive(
+                    item_path, pattern, compiled_pattern, match_type, include_dirs
+                )
+                matches.extend(child_matches)
+
+        return matches
+
+    def _sort_find_results(
+        self, matches: list[dict], sort_by: str, sort_order: str
+    ) -> list[dict]:
+        """Sort find results by the specified field."""
+        reverse = sort_order.lower() == "desc"
+
+        if sort_by == "name":
+            return sorted(matches, key=lambda x: x["name"].lower(), reverse=reverse)
+        elif sort_by == "size":
+            return sorted(matches, key=lambda x: x.get("size", 0), reverse=reverse)
+        elif sort_by == "modified":
+            return sorted(
+                matches, key=lambda x: x.get("modified_at", 0), reverse=reverse
+            )
+        elif sort_by == "created":
+            return sorted(
+                matches, key=lambda x: x.get("created_at", 0), reverse=reverse
+            )
+        else:  # default: path
+            return sorted(matches, key=lambda x: x["path"].lower(), reverse=reverse)
+
+    def _format_find_output(
+        self,
+        pattern: str,
+        match_type: str,
+        search_path: str,
+        results: list[dict],
+        total_count: int,
+        returned_count: int,
+        offset: int,
+        has_more: bool,
+        next_offset: int | None,
+    ) -> list[str]:
+        """Format find results for LLM-friendly output."""
+        lines = []
+
+        # Header with summary
+        lines.append(f"=== Find Results ===")
+        lines.append(f"Pattern: '{pattern}' ({match_type})")
+        lines.append(f"Search path: {search_path}")
+        lines.append(f"Total matches: {total_count}")
+
+        if total_count > returned_count:
+            lines.append(
+                f"Showing: {offset + 1}-{offset + returned_count} of {total_count}"
+            )
+        lines.append("")
+
+        if not results:
+            lines.append("No matches found.")
+            return lines
+
+        # Results table
+        lines.append("Matches:")
+        lines.append("-" * 60)
+
+        for i, result in enumerate(results, start=offset + 1):
+            type_indicator = "📁" if result.get("type") == "folder" else "📄"
+            path = result["path"]
+            size = result.get("size_human", "")
+
+            # Main line with path and size
+            lines.append(f"{i}. {type_indicator} {path}")
+
+            # Metadata on indented lines (only if present)
+            meta_parts = []
+            if size:
+                meta_parts.append(f"size: {size}")
+            if result.get("line_count"):
+                meta_parts.append(f"lines: {result['line_count']}")
+            if result.get("file_type"):
+                meta_parts.append(f"type: {result['file_type']}")
+            if result.get("modified"):
+                meta_parts.append(f"modified: {result['modified']}")
+
+            if meta_parts:
+                lines.append(f"   {' | '.join(meta_parts)}")
+
+            if result.get("description"):
+                desc = result["description"]
+                if len(desc) > 60:
+                    desc = desc[:57] + "..."
+                lines.append(f"   desc: {desc}")
+
+            if result.get("tags"):
+                lines.append(f"   tags: {', '.join(result['tags'])}")
+
+        # Pagination info
+        if has_more:
+            lines.append("-" * 60)
+            lines.append(
+                f"More results available. Use offset={next_offset} to see next page."
+            )
+
+        return lines
 
     def peek(self, path: str) -> ToolResult:
         """
@@ -1849,6 +2633,156 @@ class MemFS:
                 "formatted": "\n".join(output_lines),
             },
         )
+
+    # =========================================================================
+    # Git Version Control Methods
+    # =========================================================================
+
+    def _git_enabled(self) -> bool:
+        """Check if git version control is enabled and we're not in read-only mode."""
+        return self.config.sandbox.version_control_enabled and not self.read_only
+
+    def _run_git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        """Run a git command in the sandbox root directory."""
+        cmd = ["git"] + list(args)
+        return subprocess.run(
+            cmd,
+            cwd=self.sandbox.root_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    def _git_init(self) -> None:
+        """Initialize git repository in the sandbox if version control is enabled."""
+        if not self._git_enabled():
+            return
+
+        git_dir = Path(self.sandbox.root_path) / ".git"
+        if git_dir.exists():
+            return
+
+        try:
+            self._run_git("init", "-b", "main")
+            self._run_git("config", "user.email", "memfs@memlearn.local")
+            self._run_git("config", "user.name", "MemFS")
+            self._debug_log("Git repository initialized")
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Failed to initialize git: {e.stderr}")
+
+    def _git_commit_all(self, message: str) -> bool:
+        """Stage all changes and commit with the given message."""
+        if not self._git_enabled():
+            return False
+
+        try:
+            self._run_git("add", "-A")
+            result = self._run_git("status", "--porcelain", check=False)
+            if not result.stdout.strip():
+                return False
+            self._run_git("commit", "-m", message, "--allow-empty-message")
+            self._debug_log(f"Git commit: {message[:50]}...")
+            return True
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Git commit failed: {e.stderr}")
+            return False
+
+    def _git_create_session_branch(self) -> None:
+        """Create a new branch for the current session off main."""
+        if not self._git_enabled():
+            return
+
+        try:
+            dt = datetime.datetime.now()
+            branch_name = f"session-{dt.strftime('%Y%m%d-%H%M%S')}"
+            self._session_branch_name = branch_name
+            self._run_git("checkout", "-b", branch_name)
+            self._debug_log(f"Created session branch: {branch_name}")
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Failed to create session branch: {e.stderr}")
+
+    def _git_session_end_commit(self, summary: str | None = None) -> None:
+        """Commit at the end of a session with datetime and optional summary."""
+        if not self._git_enabled():
+            return
+
+        dt = datetime.datetime.now()
+        timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        if summary:
+            message = f"Session end: {timestamp}\n\n{summary}"
+        else:
+            message = f"Session end: {timestamp}"
+
+        self._git_commit_all(message)
+
+    def _git_get_session_commit_count(self) -> int:
+        """Get the number of commits in the current session (since branching from main)."""
+        if not self._git_enabled():
+            return 0
+
+        try:
+            result = self._run_git("rev-list", "--count", "main..HEAD", check=False)
+            if result.returncode == 0:
+                return int(result.stdout.strip())
+            return 0
+        except (subprocess.CalledProcessError, ValueError):
+            return 0
+
+    def undo(self, count: int = 1) -> ToolResult:
+        """
+        Undo recent filesystem changes within the current session.
+
+        Uses git to revert changes made during this session. Cannot undo
+        changes from previous sessions or before session start.
+
+        Args:
+            count: Number of changes to undo. Use -1 to undo all changes
+                in the current session. If count exceeds the number of
+                available changes, reverts all available changes.
+
+        Returns:
+            ToolResult indicating success or failure with details.
+        """
+        if not self._git_enabled():
+            return ToolResult(
+                status="error",
+                message="Version control is disabled. Cannot undo changes.",
+            )
+
+        try:
+            available_commits = self._git_get_session_commit_count()
+
+            if available_commits == 0:
+                return ToolResult(
+                    status="success",
+                    message="No changes to undo in this session.",
+                    data={"undone_count": 0, "remaining_changes": 0},
+                )
+
+            if count == -1 or count > available_commits:
+                count = available_commits
+
+            self._run_git("reset", "--hard", f"HEAD~{count}")
+
+            remaining = self._git_get_session_commit_count()
+
+            self._debug_log(f"Undone {count} changes, {remaining} remaining")
+
+            return ToolResult(
+                status="success",
+                message=f"Successfully undone {count} change(s).",
+                data={
+                    "undone_count": count,
+                    "remaining_changes": remaining,
+                },
+            )
+
+        except subprocess.CalledProcessError as e:
+            return ToolResult(
+                status="error",
+                message=f"Failed to undo changes: {e.stderr}",
+            )
 
     # =========================================================================
     # Helper Methods
@@ -1921,30 +2855,75 @@ class MemFS:
         if metadata.description:
             metadata.embedding = self.embedder.embed(metadata.description)
 
-        # Chunk and embed content
-        chunks = self.embedder.chunk_text(
-            content,
-            chunk_size=self.config.embedder.chunk_size,
-            overlap=self.config.embedder.chunk_overlap,
-        )
+        # Check if this is a conversation history file
+        is_conversation_history = metadata.path.startswith(
+            "/raw/conversation-history/"
+        ) and metadata.path.endswith(".md")
 
-        metadata.chunks = []
-        chunk_texts = []
-        chunk_metadata = []
+        if is_conversation_history:
+            # Use specialized conversation chunking
+            chunks = chunk_conversation_history(
+                content,
+                chunk_size=self.config.embedder.chunk_size
+                * 3,  # Larger chunks for conversations
+                chunk_overlap=self.config.embedder.chunk_overlap
+                * 4,  # More overlap for context
+                min_chunk_size=self.config.embedder.chunk_size // 2,
+            )
 
-        for i, (chunk_text, start_line, end_line) in enumerate(chunks):
-            chunk = Chunk.from_content(chunk_text, start_line, end_line)
-            metadata.chunks.append(chunk)
-            chunk_texts.append(chunk_text)
-            chunk_metadata.append(
-                {
+            metadata.chunks = []
+            chunk_texts = []
+            chunk_metadata_list = []
+
+            for i, (chunk_text, start_line, end_line, conv_metadata) in enumerate(
+                chunks
+            ):
+                # Create optimized text for embedding
+                embed_text = create_chunk_for_embedding(chunk_text, conv_metadata)
+                chunk = Chunk.from_content(chunk_text, start_line, end_line)
+                metadata.chunks.append(chunk)
+                chunk_texts.append(embed_text)
+
+                # Rich metadata for conversation chunks
+                chunk_meta = {
                     "path": metadata.path,
                     "chunk_index": i,
                     "start_line": start_line,
                     "end_line": end_line,
-                    "content": chunk_text[:200],  # Store snippet for search results
+                    "content": chunk_text[:200],
+                    "content_type": "conversation_history",
+                    "datetime_start": conv_metadata.get("datetime_start", "unknown"),
+                    "datetime_end": conv_metadata.get("datetime_end", "unknown"),
+                    "roles": ",".join(conv_metadata.get("roles", [])),
+                    "is_partial_turn": conv_metadata.get("is_partial_turn", False),
+                    "turn_count": conv_metadata.get("turn_count", 0),
                 }
+                chunk_metadata_list.append(chunk_meta)
+        else:
+            # Use standard chunking for other files
+            chunks = self.embedder.chunk_text(
+                content,
+                chunk_size=self.config.embedder.chunk_size,
+                overlap=self.config.embedder.chunk_overlap,
             )
+
+            metadata.chunks = []
+            chunk_texts = []
+            chunk_metadata_list = []
+
+            for i, (chunk_text, start_line, end_line) in enumerate(chunks):
+                chunk = Chunk.from_content(chunk_text, start_line, end_line)
+                metadata.chunks.append(chunk)
+                chunk_texts.append(chunk_text)
+                chunk_metadata_list.append(
+                    {
+                        "path": metadata.path,
+                        "chunk_index": i,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "content": chunk_text[:200],  # Store snippet for search results
+                    }
+                )
 
         # Batch embed chunks
         if chunk_texts:
@@ -1953,8 +2932,8 @@ class MemFS:
                 metadata.chunks[i].embedding = embedding
 
             # Add to vector store
-            ids = [f"{metadata.path}:chunk:{i}" for i in range(len(chunks))]
-            self.vector_store.add(ids, embeddings, chunk_metadata, chunk_texts)
+            ids = [f"{metadata.path}:chunk:{i}" for i in range(len(metadata.chunks))]
+            self.vector_store.add(ids, embeddings, chunk_metadata_list, chunk_texts)
 
         # Add description embedding to vector store
         if metadata.embedding:

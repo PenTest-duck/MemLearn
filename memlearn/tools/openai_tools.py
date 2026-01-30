@@ -299,6 +299,55 @@ class OpenAIToolProvider(BaseToolProvider):
                     },
                 },
             },
+            # Find files
+            {
+                "type": "function",
+                "function": {
+                    "name": self._tool_name("find"),
+                    "description": "Find files by name pattern with pagination and metadata. Use glob patterns (*.md, test_*.py, **/*.json), regex, or exact matches. Returns files with metadata (size, type, description, tags, timestamps) in an LLM-friendly format with automatic pagination to avoid context overflow.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "Pattern to match against file names. For glob: *.md, test_*.py, **/*.json. For regex: .*\\.md$. For exact: README.md",
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Base directory to search from. Defaults to '/' (entire MemFS).",
+                            },
+                            "match_type": {
+                                "type": "string",
+                                "enum": ["glob", "regex", "exact"],
+                                "description": "Pattern matching type. 'glob' for shell-style wildcards (default), 'regex' for regular expressions, 'exact' for exact filename match.",
+                            },
+                            "include_dirs": {
+                                "type": "boolean",
+                                "description": "If true, also include matching directories in results. Default is false (files only).",
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "description": "Maximum results per page (default 50). Use -1 for unlimited (caution: may be large).",
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Number of results to skip for pagination. Use 'next_offset' from previous response to get next page.",
+                            },
+                            "sort_by": {
+                                "type": "string",
+                                "enum": ["path", "name", "size", "modified", "created"],
+                                "description": "Sort results by: 'path' (default), 'name', 'size', 'modified', or 'created'.",
+                            },
+                            "sort_order": {
+                                "type": "string",
+                                "enum": ["asc", "desc"],
+                                "description": "Sort order: 'asc' (ascending, default) or 'desc' (descending).",
+                            },
+                        },
+                        "required": ["pattern"],
+                    },
+                },
+            },
         ]
 
         # Conditionally add bash tool if enabled
@@ -360,6 +409,7 @@ class OpenAIToolProvider(BaseToolProvider):
             "search": self._execute_search,
             "peek": self._execute_peek,
             "compact": self._execute_compact,
+            "find": self._execute_find,
         }
 
         # Add bash tool if enabled
@@ -449,6 +499,18 @@ class OpenAIToolProvider(BaseToolProvider):
         return self.memfs.compact_conversation(
             summary=args["summary"],
             preserve_last_n=args.get("preserve_last_n", 10),
+        )
+
+    def _execute_find(self, args: dict[str, Any]):
+        return self.memfs.find(
+            pattern=args["pattern"],
+            path=args.get("path", "/"),
+            match_type=args.get("match_type", "glob"),
+            include_dirs=args.get("include_dirs", False),
+            max_results=args.get("max_results", 50),
+            offset=args.get("offset", 0),
+            sort_by=args.get("sort_by", "path"),
+            sort_order=args.get("sort_order", "asc"),
         )
 
     def _execute_bash(self, args: dict[str, Any]) -> ToolResult:

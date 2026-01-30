@@ -36,6 +36,7 @@ from memlearn.prompts import (
     MEMFS_SYSTEM_PROMPT,
     get_custom_memfs_prompt,
     get_memfs_system_prompt,
+    get_memfs_system_prompt_with_note,
 )
 from memlearn.tools import execute_openai_tool, get_openai_tools
 from memlearn.types import (
@@ -74,6 +75,7 @@ __all__ = [
     # Prompts
     "MEMFS_SYSTEM_PROMPT",
     "get_memfs_system_prompt",
+    "get_memfs_system_prompt_with_note",
     "get_custom_memfs_prompt",
     # Entity types
     "Agent",

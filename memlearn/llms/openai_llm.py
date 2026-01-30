@@ -19,7 +19,7 @@ class OpenAILLM(BaseLLM):
         self,
         api_key: str | None = None,
         model: str = "gpt-5-mini",
-        default_max_tokens: int = 1024,
+        default_max_tokens: int = 16000,  # Reasoning models need more tokens
     ):
         """
         Initialize OpenAI LLM.
@@ -46,28 +46,51 @@ class OpenAILLM(BaseLLM):
         temperature: float = 0.7,
     ) -> LLMResponse:
         """
-        Generate a completion for the given prompt.
+        Generate a completion for the given prompt using the Responses API.
 
         Args:
             prompt: The user prompt/message.
             system_prompt: Optional system prompt for context.
             max_tokens: Maximum tokens in the response.
-            temperature: Sampling temperature (0.0 to 2.0).
+            temperature: Sampling temperature (currently unused - some models don't support it).
 
         Returns:
             LLMResponse with the generated content.
         """
-        messages: list[dict[str, str]] = []
+        response = self.client.responses.create(
+            model=self._model,
+            instructions=system_prompt,
+            input=prompt,
+            max_output_tokens=max_tokens or self.default_max_tokens,
+        )
 
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
+        # Extract text from response - try output_text first, then dig into output array
+        content = response.output_text
+        if not content and response.output:
+            # Fallback: extract from output[].content[].text
+            for item in response.output:
+                if hasattr(item, 'content') and item.content:
+                    for content_item in item.content:
+                        if hasattr(content_item, 'text') and content_item.text:
+                            content = content_item.text
+                            break
+                    if content:
+                        break
 
-        messages.append({"role": "user", "content": prompt})
+        # Extract usage information
+        usage = None
+        if response.usage:
+            usage = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
 
-        return self.complete_messages(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
+        return LLMResponse(
+            content=content or "",
+            model=response.model,
+            usage=usage,
+            raw_response=response,
         )
 
     def complete_messages(
@@ -77,34 +100,46 @@ class OpenAILLM(BaseLLM):
         temperature: float = 0.7,
     ) -> LLMResponse:
         """
-        Generate a completion for a list of messages.
+        Generate a completion for a list of messages using the Responses API.
 
         Args:
             messages: List of message dicts with 'role' and 'content'.
             max_tokens: Maximum tokens in the response.
-            temperature: Sampling temperature (0.0 to 2.0).
+            temperature: Sampling temperature (currently unused - some models don't support it).
 
         Returns:
             LLMResponse with the generated content.
         """
-        response = self.client.chat.completions.create(
+        response = self.client.responses.create(
             model=self._model,
-            messages=messages,  # type: ignore
-            max_tokens=max_tokens or self.default_max_tokens,
-            temperature=temperature,
+            input=messages,  # Responses API accepts messages array as input
+            max_output_tokens=max_tokens or self.default_max_tokens,
         )
+
+        # Extract text from response - try output_text first, then dig into output array
+        content = response.output_text
+        if not content and response.output:
+            # Fallback: extract from output[].content[].text
+            for item in response.output:
+                if hasattr(item, 'content') and item.content:
+                    for content_item in item.content:
+                        if hasattr(content_item, 'text') and content_item.text:
+                            content = content_item.text
+                            break
+                    if content:
+                        break
 
         # Extract usage information
         usage = None
         if response.usage:
             usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
 
         return LLMResponse(
-            content=response.choices[0].message.content or "",
+            content=content or "",
             model=response.model,
             usage=usage,
             raw_response=response,
@@ -157,7 +192,7 @@ class OpenAILLM(BaseLLM):
 4. **Important Details**: Any specific files, data, or information that was worked with.
 5. **Learnings**: Any insights or patterns that might be useful for future sessions.
 
-Be concise but don't omit important details.{agent_context}{extra_context}"""
+Be concise, no longer than a few paragraphs, but don't omit important details.{agent_context}{extra_context}"""
 
         prompt = f"Please summarize this conversation:\n\n{conversation_text}"
 

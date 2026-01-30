@@ -58,9 +58,19 @@ class SQLiteDatabase(BaseDatabase):
                 agent_id TEXT PRIMARY KEY,
                 name TEXT UNIQUE NOT NULL,
                 created_at REAL NOT NULL,
-                extra TEXT NOT NULL DEFAULT '{}'
+                extra TEXT NOT NULL DEFAULT '{}',
+                memory_note TEXT NOT NULL DEFAULT 'This memory is empty. No files or insights have been stored yet.'
             )
         """)
+
+        # Migration: Add memory_note column if it doesn't exist (for existing databases)
+        cursor.execute("PRAGMA table_info(agents)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "memory_note" not in columns:
+            cursor.execute("""
+                ALTER TABLE agents ADD COLUMN memory_note TEXT 
+                NOT NULL DEFAULT 'This memory is empty. No files or insights have been stored yet.'
+            """)
 
         # Sessions table
         cursor.execute("""
@@ -178,14 +188,15 @@ class SQLiteDatabase(BaseDatabase):
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            INSERT INTO agents (agent_id, name, created_at, extra)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO agents (agent_id, name, created_at, extra, memory_note)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 agent.agent_id,
                 agent.name,
                 agent.created_at,
                 json.dumps(agent.extra),
+                agent.memory_note,
             ),
         )
         self.conn.commit()
@@ -206,6 +217,7 @@ class SQLiteDatabase(BaseDatabase):
             name=row["name"],
             created_at=row["created_at"],
             extra=json.loads(row["extra"]),
+            memory_note=row["memory_note"],
         )
 
     def get_agent_by_name(self, name: str) -> Agent | None:
@@ -224,6 +236,7 @@ class SQLiteDatabase(BaseDatabase):
             name=row["name"],
             created_at=row["created_at"],
             extra=json.loads(row["extra"]),
+            memory_note=row["memory_note"],
         )
 
     def list_agents(self) -> list[Agent]:
@@ -239,9 +252,30 @@ class SQLiteDatabase(BaseDatabase):
                 name=row["name"],
                 created_at=row["created_at"],
                 extra=json.loads(row["extra"]),
+                memory_note=row["memory_note"],
             )
             for row in cursor.fetchall()
         ]
+
+    def update_agent(self, agent: Agent) -> None:
+        """Update an existing agent."""
+        assert self.conn is not None
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE agents
+            SET name = ?, extra = ?, memory_note = ?
+            WHERE agent_id = ?
+            """,
+            (
+                agent.name,
+                json.dumps(agent.extra),
+                agent.memory_note,
+                agent.agent_id,
+            ),
+        )
+        self.conn.commit()
 
     def delete_agent(self, agent_id: str) -> bool:
         """Delete an agent. Returns True if deleted."""
