@@ -95,7 +95,7 @@ Your task is to carefully read and memorize the conversation sessions you are gi
 ## Memory Organization Guidelines
 
 - Create files under /memory/ organized by speaker or topic
-- Use descriptive filenames like "caroline_events.md" or "melanie_family.md"
+- Use descriptive filenames like "chris_events.md" or "ryan_family.md"
 - Include dates and temporal context in your notes
 - Cross-reference related information between speakers
 - Summarize key facts in an easily searchable format

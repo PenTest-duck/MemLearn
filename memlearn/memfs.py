@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import os
 import re
 import subprocess
 import time
@@ -344,9 +345,11 @@ class MemFS:
         It will:
         1. Load or create the agent entity in the database
         2. Create a new session record
-        3. Initialize ephemeral sandbox
-        4. Sync persistent storage into the sandbox
-        5. Initialize conversation history
+        3. Initialize bare git repo if needed (for new agents)
+        4. Clone from bare repo into ephemeral sandbox
+        5. Update submodules (mounts) to latest
+        6. Create session branch
+        7. Initialize conversation history
 
         Args:
             agent_name: Unique name for the agent (e.g., "code-editor")
@@ -360,7 +363,8 @@ class MemFS:
 
         # Load or create agent
         agent = self.database.get_agent_by_name(agent_name)
-        if agent is None:
+        is_new_agent = agent is None
+        if is_new_agent:
             agent = Agent.create(name=agent_name)
             self.database.create_agent(agent)
 
@@ -380,30 +384,54 @@ class MemFS:
         self.config.session_id = session.session_id
         self.config.agent_name = agent.name
 
-        # Initialize sandbox
+        # Initialize sandbox (creates TemporaryDirectory)
         self.sandbox.initialize()
         self.vector_store.initialize()
 
-        # Create default folder structure in sandbox
-        self._create_default_structure()
+        # Git-based spinup (if version control enabled)
+        if self._git_vc_enabled():
+            # For new agents, initialize bare repo with initial files
+            if is_new_agent or not self._get_bare_repo_path(agent.agent_id).exists():
+                self._debug_log(f"Initializing bare repo for agent: {agent.agent_id}")
+                self._git_init_bare_repo(agent.agent_id)
 
-        # Sync from persistent storage to sandbox
-        persistent_path = self.config.sandbox.get_agent_persistent_path(agent.agent_id)
-        if persistent_path.exists():
-            self.sandbox.sync_from_persistent(str(persistent_path), PERSISTENT_FOLDERS)
-            # Clear /tmp after sync (it should always start empty)
-            self.sandbox.clear_directory_contents("tmp")
+            # Clone from bare repo into sandbox
+            clone_success = self._git_clone_from_bare(agent.agent_id)
 
-        # Remount any previously mounted folders
+            if clone_success:
+                # Update submodules (mounts) to latest and commit/push if needed
+                self._git_update_submodules_and_sync_to_main(agent.agent_id)
+
+                # Create session branch
+                self._git_create_session_branch()
+
+                # Clear /tmp (should always start empty)
+                self.sandbox.clear_directory_contents("tmp")
+            else:
+                # Clone failed - fall back to creating default structure
+                self._debug_log("Clone failed, creating default structure")
+                self._create_default_structure()
+        else:
+            # Version control disabled - use legacy sync approach
+            self._create_default_structure()
+            persistent_path = self.config.sandbox.get_agent_persistent_path(
+                agent.agent_id
+            )
+            if persistent_path.exists():
+                self.sandbox.sync_from_persistent(
+                    str(persistent_path), PERSISTENT_FOLDERS
+                )
+                self.sandbox.clear_directory_contents("tmp")
+
+        # Remount any previously mounted folders (updates database mounts)
         self._remount_saved_mounts()
 
         # Initialize conversation history for this session
         self._init_conversation_history()
 
-        # Initialize git version control, commit initial state, and create session branch
-        self._git_init()
-        self._git_commit_all("init")
-        self._git_create_session_branch()
+        # Commit the conversation history initialization
+        if self._git_enabled():
+            self._git_commit_all("Session start: initialize conversation history")
 
         self._initialized = True
 
@@ -415,9 +443,10 @@ class MemFS:
         1. Summarize conversation history using LLM (if enabled)
         2. Archive conversation history (rename CURRENT to timestamp)
         3. Generate/update memory note for next session (if enabled)
-        4. Sync sandbox to persistent storage
-        5. Update session record
-        6. Clean up ephemeral sandbox
+        4. Make final commit with session summary
+        5. Push session branch to bare repo and merge into main
+        6. Update session record
+        7. Clean up ephemeral sandbox
 
         In read_only mode, only cleanup is performed - no state modifications.
 
@@ -475,8 +504,17 @@ class MemFS:
             # Commit session end with summary (git version control)
             self._git_session_end_commit(summary=conversation_summary)
 
-            # Sync to persistent storage (excluding /tmp)
-            if self.config.agent_id:
+            # Push session branch to bare repo and merge into main
+            if self.config.agent_id and self._git_vc_enabled():
+                push_success = self._git_push_and_merge(self.config.agent_id)
+                if push_success:
+                    self._debug_log("Successfully pushed and merged session to main")
+                else:
+                    self._debug_log(
+                        "Push/merge failed (possible conflict) - session branch preserved in bare repo"
+                    )
+            elif self.config.agent_id and not self._git_vc_enabled():
+                # Version control disabled - use legacy sync approach
                 persistent_path = self.config.sandbox.get_agent_persistent_path(
                     self.config.agent_id
                 )
@@ -1066,7 +1104,11 @@ class MemFS:
         self, source_agent_name: str, mount_name: str | None = None
     ) -> ToolResult:
         """
-        Mount another agent's memory folder for read access.
+        Mount another agent's memory folder as a git submodule.
+
+        When version control is enabled, mounts are implemented as git submodules
+        pointing to the source agent's bare repo. This allows for proper version
+        tracking and collaboration between agents.
 
         Args:
             source_agent_name: Name of the agent whose memory to mount
@@ -1098,6 +1140,7 @@ class MemFS:
         # Determine mount path
         mount_name = mount_name or source_agent_name
         mount_path = f"/mnt/agents/{mount_name}"
+        sandbox_mount_path = f"mnt/agents/{mount_name}"
 
         # Check if already mounted
         existing_mounts = self.database.get_mounts_for_agent(self.config.agent_id)
@@ -1108,29 +1151,47 @@ class MemFS:
                     message=f"Mount point already in use: {mount_path}",
                 )
 
-        # Get the source agent's persistent path
-        source_persistent_path = self.config.sandbox.get_agent_persistent_path(
-            source_agent.agent_id
-        )
-        source_memory_path = source_persistent_path / "memory"
+        # Get the source agent's bare repo path
+        source_bare_repo = self._get_bare_repo_path(source_agent.agent_id)
 
-        if not source_memory_path.exists():
+        if not source_bare_repo.exists():
             return ToolResult(
                 status="error",
-                message=f"Source agent has no persistent memory: {source_agent_name}",
+                message=f"Source agent has no repository: {source_agent_name}",
             )
 
-        # Create the mount point in sandbox
-        sandbox_mount_path = f"mnt/agents/{mount_name}"
-        self.sandbox.create_directory(sandbox_mount_path)
+        # Use git submodule if version control is enabled
+        if self._git_vc_enabled():
+            # Add as git submodule
+            success = self._git_add_mount_as_submodule(
+                sandbox_mount_path, source_bare_repo
+            )
+            if not success:
+                return ToolResult(
+                    status="error",
+                    message=f"Failed to add submodule for: {source_agent_name}",
+                )
+        else:
+            # Fall back to file copy if version control is disabled
+            source_persistent_path = self.config.sandbox.get_agent_persistent_path(
+                source_agent.agent_id
+            )
+            source_memory_path = source_persistent_path / "memory"
 
-        # Copy the source memory into the mount point
-        import shutil
+            if not source_memory_path.exists():
+                return ToolResult(
+                    status="error",
+                    message=f"Source agent has no persistent memory: {source_agent_name}",
+                )
 
-        dest_path = Path(self.sandbox.root_path) / sandbox_mount_path
-        if dest_path.exists():
-            shutil.rmtree(dest_path)
-        shutil.copytree(source_memory_path, dest_path)
+            self.sandbox.create_directory(sandbox_mount_path)
+
+            import shutil
+
+            dest_path = Path(self.sandbox.root_path) / sandbox_mount_path
+            if dest_path.exists():
+                shutil.rmtree(dest_path)
+            shutil.copytree(source_memory_path, dest_path)
 
         # Create mount record in database
         mount = MountInfo.create(
@@ -1160,6 +1221,9 @@ class MemFS:
     def unmount(self, mount_path: str) -> ToolResult:
         """
         Unmount a previously mounted folder.
+
+        When version control is enabled, removes the git submodule.
+        Otherwise, removes the directory from the sandbox.
 
         Args:
             mount_path: Path of the mount point (e.g., /mnt/agents/other-agent)
@@ -1191,8 +1255,14 @@ class MemFS:
 
         # Remove from sandbox
         sandbox_path = mount_path.lstrip("/")
-        if self.sandbox.exists(sandbox_path):
-            self.sandbox.delete_directory(sandbox_path, recursive=True)
+
+        if self._git_vc_enabled():
+            # Remove git submodule
+            self._git_remove_submodule(sandbox_path)
+        else:
+            # Remove directory directly
+            if self.sandbox.exists(sandbox_path):
+                self.sandbox.delete_directory(sandbox_path, recursive=True)
 
         # Remove mount record
         self.database.delete_mount(mount_to_remove.mount_id)
@@ -1208,10 +1278,26 @@ class MemFS:
     def _remount_saved_mounts(self) -> None:
         """
         Remount previously mounted folders. Called during spinup.
+
+        When version control is enabled, submodules are already loaded via the
+        git clone operation, so this only handles the legacy file copy case.
         """
         if not self.config.agent_id:
             return
 
+        # When version control is enabled, submodules are already cloned
+        # We just need to ensure the database mount records are consistent
+        if self._git_vc_enabled():
+            # Submodules are already in place from the clone
+            # Just verify they exist and log any missing ones
+            mounts = self.database.get_mounts_for_agent(self.config.agent_id)
+            for mount in mounts:
+                sandbox_mount_path = mount.mount_path.lstrip("/")
+                if not self.sandbox.exists(sandbox_mount_path):
+                    self._debug_log(f"Mount missing after clone: {mount.mount_path}")
+            return
+
+        # Legacy file copy approach when version control is disabled
         mounts = self.database.get_mounts_for_agent(self.config.agent_id)
 
         for mount in mounts:
@@ -2637,38 +2723,238 @@ class MemFS:
     # =========================================================================
     # Git Version Control Methods
     # =========================================================================
+    #
+    # Architecture: Bare repo (persistent) + clone (ephemeral sandbox)
+    #
+    # - Each agent has a bare git repo at ~/.memlearn/persistent/agents/<agent-id>/repo.git
+    # - On spinup: clone bare repo into TemporaryDirectory, create session branch
+    # - During session: commits happen in the sandbox clone
+    # - On spindown: push session branch to bare, merge into main
+    # - Mounts are implemented as git submodules
+    #
 
     def _git_enabled(self) -> bool:
         """Check if git version control is enabled and we're not in read-only mode."""
         return self.config.sandbox.version_control_enabled and not self.read_only
 
-    def _run_git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        """Run a git command in the sandbox root directory."""
+    def _git_vc_enabled(self) -> bool:
+        """Check if git version control is enabled (regardless of read-only mode)."""
+        return self.config.sandbox.version_control_enabled
+
+    def _get_bare_repo_path(self, agent_id: str) -> Path:
+        """Get the path to the bare git repo for an agent."""
+        return self.config.sandbox.get_agent_persistent_path(agent_id) / "repo.git"
+
+    def _run_git(
+        self, *args: str, cwd: str | Path | None = None, check: bool = True
+    ) -> subprocess.CompletedProcess:
+        """Run a git command in the specified directory (defaults to sandbox root)."""
         cmd = ["git"] + list(args)
+        work_dir = str(cwd) if cwd else self.sandbox.root_path
         return subprocess.run(
             cmd,
-            cwd=self.sandbox.root_path,
+            cwd=work_dir,
             capture_output=True,
             text=True,
             check=check,
         )
 
-    def _git_init(self) -> None:
-        """Initialize git repository in the sandbox if version control is enabled."""
+    def _git_init_bare_repo(self, agent_id: str) -> bool:
+        """
+        Initialize a bare git repo for an agent with initial files.
+
+        This creates a bare repo, then creates a temporary working tree to
+        commit the initial default structure, then cleans up.
+
+        Args:
+            agent_id: The agent ID to create the repo for.
+
+        Returns:
+            True if repo was created/exists, False on failure.
+        """
+        bare_repo_path = self._get_bare_repo_path(agent_id)
+
+        # If bare repo already exists, nothing to do
+        if bare_repo_path.exists():
+            self._debug_log(f"Bare repo already exists: {bare_repo_path}")
+            return True
+
+        try:
+            # Create parent directories
+            bare_repo_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Initialize bare repo
+            subprocess.run(
+                ["git", "init", "--bare", "-b", "main", str(bare_repo_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self._debug_log(f"Initialized bare repo: {bare_repo_path}")
+
+            # Create a temporary directory to set up initial content
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory(prefix="memfs-init-") as temp_dir:
+                # Clone the empty bare repo
+                subprocess.run(
+                    ["git", "clone", str(bare_repo_path), temp_dir],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+                # Configure git user
+                subprocess.run(
+                    ["git", "config", "user.email", "memfs@memlearn.local"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "MemFS"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    check=True,
+                )
+
+                # Create default folder structure in temp dir
+                for folder in [
+                    "raw",
+                    "raw/conversation-history",
+                    "raw/artifacts",
+                    "raw/skills",
+                    "memory",
+                    "tmp",
+                    "mnt",
+                    "mnt/agents",
+                ]:
+                    os.makedirs(os.path.join(temp_dir, folder), exist_ok=True)
+                    # Add .gitkeep to empty directories
+                    gitkeep_path = os.path.join(temp_dir, folder, ".gitkeep")
+                    with open(gitkeep_path, "w") as f:
+                        f.write("")
+
+                # Create AGENTS.md
+                with open(os.path.join(temp_dir, "AGENTS.md"), "w") as f:
+                    f.write(AGENTS_MD_CONTENT)
+
+                # Stage and commit
+                subprocess.run(
+                    ["git", "add", "-A"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", "init"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    check=True,
+                )
+
+                # Push to bare repo
+                subprocess.run(
+                    ["git", "push", "origin", "main"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    check=True,
+                )
+
+            self._debug_log(f"Initial commit pushed to bare repo: {bare_repo_path}")
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Failed to initialize bare repo: {e.stderr}")
+            return False
+
+    def _git_clone_from_bare(self, agent_id: str) -> bool:
+        """
+        Clone from bare repo into the sandbox (shallow, single-branch).
+
+        The sandbox must already be initialized (TemporaryDirectory created).
+
+        Args:
+            agent_id: The agent ID whose repo to clone.
+
+        Returns:
+            True on success, False on failure.
+        """
+        bare_repo_path = self._get_bare_repo_path(agent_id)
+
+        if not bare_repo_path.exists():
+            self._debug_log(f"Bare repo does not exist: {bare_repo_path}")
+            return False
+
+        try:
+            # Clone shallow (depth=1) into sandbox root
+            # We clone into a temp location first, then move contents
+            # because git clone won't clone into a non-empty directory
+            sandbox_root = Path(self.sandbox.root_path)
+
+            # Clone with depth=1 for lightweight clone
+            # Use --no-checkout initially, then checkout after moving
+            clone_temp = sandbox_root / ".clone_temp"
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--single-branch",
+                    "--branch",
+                    "main",
+                    str(bare_repo_path),
+                    str(clone_temp),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            # Move contents from clone_temp to sandbox_root
+            import shutil
+
+            for item in clone_temp.iterdir():
+                dest = sandbox_root / item.name
+                if dest.exists():
+                    if dest.is_dir():
+                        shutil.rmtree(dest)
+                    else:
+                        dest.unlink()
+                shutil.move(str(item), str(dest))
+
+            # Remove the now-empty clone_temp
+            clone_temp.rmdir()
+
+            # Configure git user in sandbox
+            self._run_git("config", "user.email", "memfs@memlearn.local")
+            self._run_git("config", "user.name", "MemFS")
+
+            # Fetch full history for the main branch so we can compare commits
+            # (needed for _git_get_session_commit_count to work)
+            self._run_git("fetch", "--unshallow", check=False)
+
+            self._debug_log(f"Cloned from bare repo into sandbox")
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Failed to clone from bare repo: {e.stderr}")
+            return False
+
+    def _git_create_session_branch(self) -> None:
+        """Create a new branch for the current session off main."""
         if not self._git_enabled():
             return
 
-        git_dir = Path(self.sandbox.root_path) / ".git"
-        if git_dir.exists():
-            return
-
         try:
-            self._run_git("init", "-b", "main")
-            self._run_git("config", "user.email", "memfs@memlearn.local")
-            self._run_git("config", "user.name", "MemFS")
-            self._debug_log("Git repository initialized")
+            dt = datetime.datetime.now()
+            branch_name = f"session-{dt.strftime('%Y%m%d-%H%M%S')}"
+            self._session_branch_name = branch_name
+            self._run_git("checkout", "-b", branch_name)
+            self._debug_log(f"Created session branch: {branch_name}")
         except subprocess.CalledProcessError as e:
-            self._debug_log(f"Failed to initialize git: {e.stderr}")
+            self._debug_log(f"Failed to create session branch: {e.stderr}")
 
     def _git_commit_all(self, message: str) -> bool:
         """Stage all changes and commit with the given message."""
@@ -2687,20 +2973,6 @@ class MemFS:
             self._debug_log(f"Git commit failed: {e.stderr}")
             return False
 
-    def _git_create_session_branch(self) -> None:
-        """Create a new branch for the current session off main."""
-        if not self._git_enabled():
-            return
-
-        try:
-            dt = datetime.datetime.now()
-            branch_name = f"session-{dt.strftime('%Y%m%d-%H%M%S')}"
-            self._session_branch_name = branch_name
-            self._run_git("checkout", "-b", branch_name)
-            self._debug_log(f"Created session branch: {branch_name}")
-        except subprocess.CalledProcessError as e:
-            self._debug_log(f"Failed to create session branch: {e.stderr}")
-
     def _git_session_end_commit(self, summary: str | None = None) -> None:
         """Commit at the end of a session with datetime and optional summary."""
         if not self._git_enabled():
@@ -2716,18 +2988,276 @@ class MemFS:
 
         self._git_commit_all(message)
 
+    def _git_push_and_merge(self, agent_id: str) -> bool:
+        """
+        Push session branch to bare repo and merge into main.
+
+        Args:
+            agent_id: The agent ID whose repo to push to.
+
+        Returns:
+            True on success, False on failure (including merge conflicts).
+        """
+        if not self._git_enabled():
+            return False
+
+        bare_repo_path = self._get_bare_repo_path(agent_id)
+        branch_name = getattr(self, "_session_branch_name", None)
+
+        if not branch_name:
+            self._debug_log("No session branch name set, skipping push")
+            return False
+
+        try:
+            # Push session branch to bare repo
+            self._run_git("push", "origin", branch_name)
+            self._debug_log(f"Pushed {branch_name} to bare repo")
+
+            # Now merge into main in the bare repo
+            # We need to do this in a temporary worktree or clone
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory(prefix="memfs-merge-") as temp_dir:
+                # Clone bare repo
+                subprocess.run(
+                    ["git", "clone", str(bare_repo_path), temp_dir],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+                # Configure git user
+                subprocess.run(
+                    ["git", "config", "user.email", "memfs@memlearn.local"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "MemFS"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    check=True,
+                )
+
+                # Checkout main
+                subprocess.run(
+                    ["git", "checkout", "main"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    check=True,
+                )
+
+                # Try to merge session branch
+                merge_result = subprocess.run(
+                    [
+                        "git",
+                        "merge",
+                        f"origin/{branch_name}",
+                        "-m",
+                        f"Merge {branch_name} into main",
+                    ],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                if merge_result.returncode != 0:
+                    # Merge conflict - abort
+                    self._debug_log(f"Merge conflict, aborting: {merge_result.stderr}")
+                    subprocess.run(
+                        ["git", "merge", "--abort"],
+                        cwd=temp_dir,
+                        capture_output=True,
+                        check=False,
+                    )
+                    return False
+
+                # Push merged main back to bare repo
+                subprocess.run(
+                    ["git", "push", "origin", "main"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    check=True,
+                )
+
+            self._debug_log(f"Merged {branch_name} into main in bare repo")
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Failed to push/merge: {e.stderr}")
+            return False
+
     def _git_get_session_commit_count(self) -> int:
         """Get the number of commits in the current session (since branching from main)."""
         if not self._git_enabled():
             return 0
 
         try:
-            result = self._run_git("rev-list", "--count", "main..HEAD", check=False)
+            # Use origin/main as the base since we cloned
+            result = self._run_git(
+                "rev-list", "--count", "origin/main..HEAD", check=False
+            )
             if result.returncode == 0:
                 return int(result.stdout.strip())
             return 0
         except (subprocess.CalledProcessError, ValueError):
             return 0
+
+    def _git_update_submodules(self) -> None:
+        """
+        Update all submodules to their latest commits.
+
+        Called during spinup to ensure mounts point to latest.
+        """
+        if not self._git_vc_enabled():
+            return
+
+        try:
+            # Check if there are any submodules
+            gitmodules_path = Path(self.sandbox.root_path) / ".gitmodules"
+            if not gitmodules_path.exists():
+                return
+
+            # Update submodules to latest
+            self._run_git("submodule", "update", "--init", "--recursive", "--remote")
+            self._debug_log("Updated submodules to latest")
+
+            # Stage any submodule pointer changes
+            result = self._run_git("status", "--porcelain", check=False)
+            if result.stdout.strip():
+                self._run_git("add", "-A")
+                self._run_git(
+                    "commit", "-m", "Update submodules to latest", check=False
+                )
+                self._debug_log("Committed submodule updates")
+
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Failed to update submodules: {e.stderr}")
+
+    def _git_update_submodules_and_sync_to_main(self, agent_id: str) -> None:
+        """
+        Update submodules to latest and push any changes to main before creating session branch.
+
+        This ensures that:
+        1. All submodules (mounts) point to their latest commits
+        2. Any submodule pointer updates are committed and pushed to main
+        3. The session branch will start from the updated main
+
+        Called during spinup after cloning but before creating session branch.
+
+        Args:
+            agent_id: The agent ID whose repo to update.
+        """
+        if not self._git_vc_enabled():
+            return
+
+        try:
+            # Check if there are any submodules
+            gitmodules_path = Path(self.sandbox.root_path) / ".gitmodules"
+            if not gitmodules_path.exists():
+                self._debug_log("No submodules found, skipping update")
+                return
+
+            # Update submodules to latest
+            self._run_git("submodule", "update", "--init", "--recursive", "--remote")
+            self._debug_log("Updated submodules to latest")
+
+            # Check if there are any changes to commit
+            result = self._run_git("status", "--porcelain", check=False)
+            if not result.stdout.strip():
+                self._debug_log("No submodule changes to commit")
+                return
+
+            # Commit the submodule updates
+            self._run_git("add", "-A")
+            self._run_git("commit", "-m", "Update submodules to latest")
+            self._debug_log("Committed submodule updates")
+
+            # Push directly to main (we're still on main at this point)
+            self._run_git("push", "origin", "main")
+            self._debug_log("Pushed submodule updates to main in bare repo")
+
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Failed to update/push submodules: {e.stderr}")
+
+    def _git_add_mount_as_submodule(
+        self, mount_path: str, source_repo_path: Path
+    ) -> bool:
+        """
+        Add a mount as a git submodule.
+
+        Args:
+            mount_path: The path within the sandbox (e.g., "mnt/agents/other-agent")
+            source_repo_path: Path to the source agent's bare repo
+
+        Returns:
+            True on success, False on failure.
+        """
+        if not self._git_enabled():
+            return False
+
+        try:
+            # Add submodule
+            self._run_git(
+                "submodule",
+                "add",
+                "-b",
+                "main",
+                str(source_repo_path),
+                mount_path,
+            )
+            self._run_git("add", "-A")
+            self._run_git("commit", "-m", f"Add submodule mount: {mount_path}")
+            self._debug_log(f"Added submodule: {mount_path} -> {source_repo_path}")
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Failed to add submodule: {e.stderr}")
+            return False
+
+    def _git_remove_submodule(self, mount_path: str) -> bool:
+        """
+        Remove a submodule mount.
+
+        Args:
+            mount_path: The submodule path to remove
+
+        Returns:
+            True on success, False on failure.
+        """
+        if not self._git_enabled():
+            return False
+
+        try:
+            # Deinitialize the submodule
+            self._run_git("submodule", "deinit", "-f", mount_path, check=False)
+
+            # Remove from .git/modules
+            git_modules_path = (
+                Path(self.sandbox.root_path) / ".git" / "modules" / mount_path
+            )
+            if git_modules_path.exists():
+                import shutil
+
+                shutil.rmtree(git_modules_path)
+
+            # Remove the submodule entry
+            self._run_git("rm", "-f", mount_path, check=False)
+
+            # Commit the removal
+            self._run_git("add", "-A")
+            result = self._run_git("status", "--porcelain", check=False)
+            if result.stdout.strip():
+                self._run_git("commit", "-m", f"Remove submodule mount: {mount_path}")
+
+            self._debug_log(f"Removed submodule: {mount_path}")
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self._debug_log(f"Failed to remove submodule: {e.stderr}")
+            return False
 
     def undo(self, count: int = 1) -> ToolResult:
         """
@@ -3066,27 +3596,3 @@ def load_agent(
         MemFS instance with persistence enabled.
     """
     return MemFS.for_agent(agent_name, config)
-
-
-# Keep backward compatibility
-def load_memfs(
-    agent_id: str | None = None,
-    config: MemLearnConfig | None = None,
-) -> MemFS:
-    """
-    Load a MemFS instance (deprecated - use load_agent() for persistence).
-
-    Args:
-        agent_id: Agent ID for loading specific memory.
-        config: Optional configuration.
-
-    Returns:
-        MemFS instance.
-    """
-    if config is None:
-        config = MemLearnConfig.from_env()
-
-    if agent_id:
-        config.agent_id = agent_id
-
-    return create_memfs(config)

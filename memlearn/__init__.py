@@ -31,7 +31,7 @@ Ephemeral Usage (No persistence):
 """
 
 from memlearn.config import MemLearnConfig
-from memlearn.memfs import MemFS, create_memfs, load_agent, load_memfs
+from memlearn.memfs import MemFS, create_memfs, load_agent
 from memlearn.prompts import (
     MEMFS_SYSTEM_PROMPT,
     get_custom_memfs_prompt,
@@ -67,7 +67,6 @@ __all__ = [
     "MemLearnConfig",
     # Factory functions
     "create_memfs",
-    "load_memfs",
     "load_agent",
     # Tool helpers
     "get_openai_tools",

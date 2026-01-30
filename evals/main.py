@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import time
+import atexit
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,23 @@ from memlearn.types import SessionStatus
 from evals.judge import Judge, JudgeResult, QuestionCategory, calculate_metrics
 
 load_dotenv()
+
+# Global variable to track CSV file for emergency cleanup
+_GLOBAL_CSV_FILE = None
+
+
+def _emergency_csv_save():
+    """Emergency function to save any pending results if script crashes."""
+    global _GLOBAL_CSV_FILE
+    if _GLOBAL_CSV_FILE and _GLOBAL_CSV_FILE.exists():
+        try:
+            # Force flush any pending writes
+            with open(_GLOBAL_CSV_FILE, "a", encoding="utf-8") as f:
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            pass  # Silent failure in emergency cleanup
+
 
 MODEL_NAME = os.getenv("MEMLEARN_MODEL", "openai:gpt-5.2")
 RESULTS_DIR = Path(__file__).parent / "results"
@@ -149,9 +167,16 @@ def get_category_name(category: int) -> str:
     return names.get(category, f"category_{category}")
 
 
-def write_results_csv(csv_path: Path, sample_results: list[dict[str, Any]]) -> None:
+def write_results_csv(
+    csv_path: Path, sample_results: list[dict[str, Any]], append_mode: bool = False
+) -> None:
     """
     Write detailed evaluation results to a CSV file.
+
+    Args:
+        csv_path: Path to CSV file
+        sample_results: List of sample results with nested results
+        append_mode: If True, append to existing file; if False, create new file
 
     Columns: sample_id, question_idx, category, category_name, question,
              expected_answer, model_response, is_correct, judge_reasoning, judge_raw_response
@@ -169,9 +194,15 @@ def write_results_csv(csv_path: Path, sample_results: list[dict[str, Any]]) -> N
         "judge_raw_response",
     ]
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    mode = "a" if append_mode else "w"
+    file_exists = csv_path.exists() and append_mode
+
+    with open(csv_path, mode, newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
+
+        # Write header only if creating new file or file doesn't exist
+        if not file_exists:
+            writer.writeheader()
 
         for sample in sample_results:
             for result in sample.get("results", []):
@@ -182,6 +213,7 @@ def evaluate_sample(
     sample: dict[str, Any],
     sample_idx: int,
     judge: Judge,
+    csv_path: Path | None = None,
     model_name: str = MODEL_NAME,
     verbose: bool = True,
 ) -> dict[str, Any]:
@@ -244,6 +276,18 @@ def evaluate_sample(
             }
         )
 
+        # Save result to CSV immediately if csv_path provided
+        if csv_path:
+            try:
+                write_results_csv(
+                    csv_path,
+                    [{"sample_id": sample_id, "results": [results[-1]]}],
+                    append_mode=True,
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"  Warning: Failed to save result to CSV: {e}")
+
         if verbose:
             status = "✓ CORRECT" if judge_result.is_correct else "✗ INCORRECT"
             print(f"  Result: {status}")
@@ -298,6 +342,25 @@ def run_evaluation(
     if sample_ids is None:
         sample_ids = list(range(len(dataset)))
 
+    # Initialize CSV file at the start
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_file = RESULTS_DIR / f"{dataset_name}_results_{timestamp}.csv"
+
+    # Register emergency cleanup
+    global _GLOBAL_CSV_FILE
+    _GLOBAL_CSV_FILE = csv_file
+    atexit.register(_emergency_csv_save)
+
+    # Create empty CSV with header
+    try:
+        write_results_csv(csv_file, [], append_mode=False)
+        if verbose:
+            print(f"CSV initialized: {csv_file}")
+    except Exception as e:
+        if verbose:
+            print(f"Warning: Failed to initialize CSV file: {e}")
+        csv_file = None
+
     if verbose:
         print(f"MemLearn Evaluation")
         print(f"=" * 60)
@@ -342,6 +405,7 @@ def run_evaluation(
             sample=sample,
             sample_idx=idx,
             judge=judge,
+            csv_path=csv_file,
             model_name=model_name,
             verbose=verbose,
         )
@@ -386,11 +450,21 @@ def run_evaluation(
     with open(results_file, "w") as f:
         json.dump(final_results, f, indent=2)
 
-    csv_file = RESULTS_DIR / f"{dataset_name}_results_{timestamp}.csv"
-    write_results_csv(csv_file, all_sample_results)
-
-    if verbose:
-        print(f"CSV results saved to: {csv_file}")
+    # Write final CSV (redundant but ensures completeness)
+    if csv_file:
+        try:
+            write_results_csv(csv_file, all_sample_results, append_mode=False)
+            if verbose:
+                print(f"CSV results saved to: {csv_file}")
+        except Exception as e:
+            if verbose:
+                print(f"Warning: Failed to write final CSV: {e}")
+    else:
+        # Fallback to original behavior if CSV wasn't initialized
+        csv_file = RESULTS_DIR / f"{dataset_name}_results_{timestamp}.csv"
+        write_results_csv(csv_file, all_sample_results, append_mode=False)
+        if verbose:
+            print(f"CSV results saved to: {csv_file}")
 
     if verbose:
         print(f"\n{'=' * 60}")
